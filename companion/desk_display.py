@@ -1,0 +1,523 @@
+#!/usr/bin/env python3
+"""Desk Display companion app.
+
+Reads what is playing on this computer and sends it to the Cheap Yellow Display
+over the USB cable. Button taps and scrubs on the display come back the same way
+and control the music app.
+
+    Windows: follows whatever Windows shows in its media controls (Apple Music,
+             Spotify, a browser tab, ...).
+    Mac:     follows the Music app (Apple Music).
+
+It also keeps the display's clock set, sends the weather for the city in
+settings.json, and sends the list in reminders.txt.
+
+Run:   python desk_display.py            find the display and start
+       python desk_display.py --demo     show fake tracks and weather, to test the display
+       python desk_display.py --port COM5
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import queue
+import struct
+import sys
+import threading
+import time
+import unicodedata
+import urllib.parse
+import urllib.request
+from typing import Optional
+
+import extras
+from nowplaying import NowPlaying
+
+ART_SIZE = 140
+ART_BYTES = ART_SIZE * ART_SIZE * 2
+BAUD = 460800
+
+STATE_PLAYING, STATE_HAS_POS, STATE_CAN_SEEK = 0x01, 0x02, 0x04
+
+
+# --------------------------------------------------------------------------- protocol
+def frame(kind: bytes, payload: bytes = b"") -> bytes:
+    """'D' 'T' type, 4-byte length, payload, 2-byte checksum. Matches protocol.h."""
+    return b"DT" + kind + struct.pack("<I", len(payload)) + payload + struct.pack("<H", sum(payload) & 0xFFFF)
+
+
+_PUNCT = {
+    "‘": "'", "’": "'", "“": '"', "”": '"', "–": "-", "—": "-",
+    "…": "...", "•": "*", "×": "x", "ß": "ss", "æ": "ae", "Æ": "AE",
+    "ø": "o", "Ø": "O", "œ": "oe", "Œ": "OE", " ": " ",
+}
+
+
+def to_ascii(text: str, limit: int = 96) -> bytes:
+    """The display's fonts only have basic Latin letters, so fold accents and swap the rest for '?'."""
+    out = []
+    for ch in text or "":
+        ch = _PUNCT.get(ch, ch)
+        for c in unicodedata.normalize("NFKD", ch):
+            if unicodedata.combining(c):
+                continue
+            out.append(c if 32 <= ord(c) < 127 else "?")
+    return " ".join("".join(out).split())[:limit].encode("ascii")
+
+
+def encode_meta(np: NowPlaying) -> bytes:
+    return frame(b"M", b"\n".join([to_ascii(np.title), to_ascii(np.artist), to_ascii(np.album)]))
+
+
+def encode_state(np: NowPlaying) -> bytes:
+    has_pos = np.position_ms is not None and np.duration_ms > 0
+    flags = (STATE_PLAYING if np.playing else 0) | (STATE_HAS_POS if has_pos else 0) | \
+            (STATE_CAN_SEEK if (np.can_seek and has_pos) else 0)
+    pos = max(0, min(int(np.position_ms or 0), 0xFFFFFFFF))
+    dur = max(0, min(int(np.duration_ms or 0), 0xFFFFFFFF))
+    return frame(b"S", struct.pack("<BII", flags, pos, dur))
+
+
+def encode_art(image_bytes: bytes) -> bytes:
+    """Any image file -> 140 x 140 RGB565, high byte first."""
+    from PIL import Image, ImageOps
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    img = ImageOps.fit(img, (ART_SIZE, ART_SIZE), Image.LANCZOS)
+    rgb = img.tobytes()
+    out = bytearray(ART_BYTES)
+    j = 0
+    for i in range(0, len(rgb), 3):
+        v = ((rgb[i] & 0xF8) << 8) | ((rgb[i + 1] & 0xFC) << 3) | (rgb[i + 2] >> 3)
+        out[j] = v >> 8
+        out[j + 1] = v & 0xFF
+        j += 2
+    return frame(b"A", bytes(out))
+
+
+# --------------------------------------------------------------------------- online art fallback
+def lookup_art_online(np: NowPlaying, timeout: float = 5.0) -> Optional[bytes]:
+    """Ask Apple's public iTunes Search for the cover. Used only when the music app gives no picture."""
+    term = " ".join(x for x in (np.artist, np.title) if x)
+    if not term:
+        return None
+    url = "https://itunes.apple.com/search?" + urllib.parse.urlencode({"term": term, "entity": "song", "limit": 5})
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            results = json.load(r).get("results", [])
+        if not results:
+            return None
+        want = (np.album or "").lower()
+        best = next((x for x in results if want and x.get("collectionName", "").lower() == want), results[0])
+        art_url = best.get("artworkUrl100")
+        if not art_url:
+            return None
+        art_url = art_url.replace("100x100", "300x300")
+        with urllib.request.urlopen(art_url, timeout=timeout) as r:
+            return r.read()
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- demo source
+class DemoMedia:
+    """Fake tracks, for testing the display without any music app."""
+    TRACKS = [
+        ("Fury Road", "The Wasteland Radio", "Guzzoline Sessions", 214),
+        ("A Very Long Song Title That Needs To Wrap Across Several Lines", "Artist With A Long Name Too", "Deluxe Edition", 372),
+        ("Chrome", "War Rig", "Witness", 95),
+    ]
+
+    def __init__(self):
+        self.i, self.playing, self.pos, self.t = 0, True, 0.0, time.monotonic()
+
+    def _tick(self):
+        now = time.monotonic()
+        if self.playing:
+            self.pos += now - self.t
+        self.t = now
+        if self.pos >= self.TRACKS[self.i][3]:
+            self.next()
+
+    def poll(self):
+        self._tick()
+        t = self.TRACKS[self.i]
+        return NowPlaying(t[0], t[1], t[2], self.playing, int(self.pos * 1000), t[3] * 1000, True)
+
+    def get_art(self, np):
+        # Red top-left, green top-right, blue bottom-left, white bottom-right:
+        # if the display shows other colors, the screen-chip setting is wrong.
+        from PIL import Image, ImageDraw
+        img = Image.new("RGB", (280, 280))
+        d = ImageDraw.Draw(img)
+        for (x, y), c in zip([(0, 0), (140, 0), (0, 140), (140, 140)],
+                             [(220, 30, 30), (30, 190, 60), (40, 70, 220), (240, 240, 240)]):
+            d.rectangle([x, y, x + 139, y + 139], fill=c)
+        d.ellipse([90, 90, 190, 190], fill=(239, 159, 39))
+        d.text((132, 132), str(self.i + 1), fill=(0, 0, 0))
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue()
+
+    def play_pause(self):
+        self._tick(); self.playing = not self.playing
+
+    def next(self):
+        self.i = (self.i + 1) % len(self.TRACKS); self.pos = 0.0
+
+    def previous(self):
+        if self.pos > 3:
+            self.pos = 0.0
+        else:
+            self.i = (self.i - 1) % len(self.TRACKS); self.pos = 0.0
+
+    def seek(self, ms):
+        self._tick(); self.pos = ms / 1000.0
+
+
+def make_media(args):
+    if args.demo:
+        return DemoMedia()
+    if sys.platform == "win32":
+        from media_windows import WindowsMedia
+        return WindowsMedia(app_filter=args.app)
+    if sys.platform == "darwin":
+        from media_mac import MacMusic
+        return MacMusic()
+    sys.exit("This app supports Windows and macOS. Use --demo to test the display on other systems.")
+
+
+# --------------------------------------------------------------------------- serial link
+class Link:
+    def __init__(self, port: str):
+        import serial
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.baudrate = BAUD
+        self.ser.timeout = 0.1
+        self.ser.write_timeout = 5
+        self.ser.dtr = False          # keep these low so opening the port does not hold the board in reset
+        self.ser.rts = False
+        self.ser.open()
+        self.lines: "queue.Queue[str]" = queue.Queue()
+        self.error: Optional[Exception] = None
+        self._stop = False
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def _reader(self):
+        buf = b""
+        while not self._stop:
+            try:
+                data = self.ser.read(256)
+            except Exception as e:      # unplugged
+                self.error = e
+                return
+            if not data:
+                continue
+            buf += data
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                text = line.decode("ascii", "ignore").strip()
+                if text.startswith("DT:"):
+                    self.lines.put(text)
+            if len(buf) > 4096:
+                buf = buf[-256:]
+
+    def send(self, data: bytes):
+        if self.error:
+            raise self.error
+        self.ser.write(data)
+
+    def close(self):
+        self._stop = True
+        try:
+            self.ser.close()
+        except Exception:
+            pass
+
+
+def find_port(preferred: Optional[str]) -> Optional[str]:
+    from serial.tools import list_ports
+    if preferred:
+        return preferred
+    usb_serial_chips = {0x1A86, 0x10C4, 0x0403}      # CH340 (most of these boards), CP210x, FTDI
+    ports = [p for p in list_ports.comports() if p.vid in usb_serial_chips]
+    ports.sort(key=lambda p: (p.vid != 0x1A86, p.device))
+    return ports[0].device if ports else None
+
+
+# --------------------------------------------------------------------------- main loop
+class Companion:
+    ART_RETRY_AT = (0.3, 1.5, 3.5, 6.0)     # seconds after a track change; the picture can arrive late
+
+    def __init__(self, media, args):
+        self.media = media
+        self.args = args
+        self.online_results: "queue.Queue" = queue.Queue()
+
+        self.settings = extras.load_settings(args.data_dir, self.log)
+        self.h24 = bool(self.settings.get("clock_24_hour"))
+        self.reminders = extras.Reminders(os.path.join(args.data_dir, "reminders.txt"), self.h24, to_ascii)
+        self.weather_frame = frame(b"W", extras.weather_error("Getting the weather."))
+        self.weather_updates: "queue.Queue" = queue.Queue()
+        threading.Thread(target=self._weather_loop, daemon=True).start()
+
+    def _weather_loop(self):
+        """Runs in the background: fetch now, then every 15 minutes. Retry sooner after a failure."""
+        if self.args.demo:
+            self.weather_updates.put(frame(b"W", extras.DEMO_WEATHER))
+            return
+        has_place = self.settings.get("city") or ("latitude" in self.settings and "longitude" in self.settings)
+        if not has_place:
+            self.weather_updates.put(frame(b"W", extras.weather_error("Set your city in settings.json")))
+            return
+        place, have_data = None, False
+        while True:
+            try:
+                place, forecast = extras.fetch_weather(self.settings, place)
+                self.weather_updates.put(frame(b"W", extras.weather_payload(place, forecast, self.settings, to_ascii)))
+                have_data = True
+                wait = 15 * 60
+            except LookupError as e:
+                self.log(f"Weather: {e}. Check the city in settings.json.")
+                self.weather_updates.put(frame(b"W", extras.weather_error("City not found. Check settings.json")))
+                return
+            except Exception as e:
+                if self.args.verbose:
+                    self.log("weather error:", repr(e))
+                if not have_data:
+                    self.weather_updates.put(frame(b"W", extras.weather_error("Could not get the weather.")))
+                wait = 60
+            time.sleep(wait)
+
+    def log(self, *a):
+        print(time.strftime("%H:%M:%S"), *a, flush=True)
+
+    def run(self):
+        waiting_shown = False
+        while True:
+            port = find_port(self.args.port)
+            if not port:
+                if not waiting_shown:
+                    self.log("Looking for the display. Plug it in with a USB data cable.")
+                    waiting_shown = True
+                time.sleep(2)
+                continue
+            waiting_shown = False
+            link = None
+            try:
+                link = Link(port)
+                self.log(f"Opened {port}. Waiting for the display to answer.")
+                self.session(link)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                self.log(f"Lost the display ({e}). Trying again.")
+            finally:
+                if link:
+                    link.close()
+            time.sleep(2)
+
+    def session(self, link: Link):
+        ready = False
+        last_hello = 0.0
+        sent_key = None
+        last_state = None
+        last_state_at = 0.0
+        next_poll = 0.0
+        art_due: list = []
+        art_hash = None
+        art_frame = None
+        online_started = False
+        current: Optional[NowPlaying] = None
+        warned_no_answer = False
+        opened_at = time.monotonic()
+        last_clock_at = 0.0          # when the time, reminders and alerts were last sent or checked
+        last_reminder_check = 0.0
+        last_alert_check = 0.0
+        weather_sent = None
+
+        while True:
+            now = time.monotonic()
+            if link.error:
+                raise link.error
+
+            # ---- messages from the display
+            while True:
+                try:
+                    line = link.lines.get_nowait()
+                except queue.Empty:
+                    break
+                if line.startswith("DT:READY"):
+                    if not ready:
+                        self.log("Display connected.")
+                    ready = True
+                    sent_key, last_state, art_hash, art_frame = None, None, None, None
+                    next_poll = 0.0
+                    last_clock_at, weather_sent = 0.0, None
+                    self.reminders.stamp = None            # send the list again
+                elif line.startswith("DT:ERR:NODISPLAY"):
+                    self.log("The board cannot find its screen. Set DISPLAY_DRIVER to 1 or 2 in the firmware and upload again.")
+                elif line == "DT:NAK:A" and art_frame:
+                    link.send(art_frame)
+                elif line.startswith("DT:CMD:REM:"):
+                    try:
+                        self.reminders.toggle(int(line[11:]))
+                    except Exception as e:
+                        self.log(f"Could not update reminders.txt: {e}")
+                    self.reminders.stamp = None
+                    last_reminder_check = 0.0
+                elif line.startswith("DT:CMD:"):
+                    self.command(line[7:])
+                    next_poll = min(next_poll, now + 0.15)
+
+            if not ready:
+                if now - last_hello >= 1.0:
+                    link.send(frame(b"H"))
+                    last_hello = now
+                if not warned_no_answer and now - opened_at > 12:
+                    self.log("No answer yet. Check that the firmware is on the board, or pass --port to pick another port.")
+                    warned_no_answer = True
+                time.sleep(0.05)
+                continue
+
+            # ---- clock, weather, reminders
+            if now - last_clock_at >= 30.0:
+                link.send(frame(b"T", extras.time_payload(self.h24)))
+                last_clock_at = now
+
+            try:
+                while True:
+                    self.weather_frame = self.weather_updates.get_nowait()
+            except queue.Empty:
+                pass
+            if weather_sent is not self.weather_frame:
+                link.send(self.weather_frame)
+                weather_sent = self.weather_frame
+
+            if now - last_reminder_check >= 1.0:
+                last_reminder_check = now
+                if self.reminders.changed():
+                    self.reminders.load()
+                    link.send(frame(b"R", self.reminders.payload()))
+            if now - last_alert_check >= 5.0:
+                last_alert_check = now
+                for alert in self.reminders.due_alerts():
+                    link.send(frame(b"N", alert))
+                    self.log("Reminder:", alert.decode().replace("\n", " ").strip())
+
+            # ---- what is playing
+            if now >= next_poll:
+                next_poll = now + 0.5
+                try:
+                    current = self.media.poll()
+                except Exception as e:
+                    if self.args.verbose:
+                        self.log("media error:", repr(e))
+                    current = None
+
+                if current is None:
+                    if sent_key != "IDLE" or now - last_state_at >= 1.0:
+                        link.send(frame(b"X"))
+                        if sent_key != "IDLE":
+                            self.log("Nothing playing.")
+                        sent_key, last_state, last_state_at = "IDLE", None, now
+                else:
+                    if current.key() != sent_key:
+                        link.send(encode_meta(current))
+                        self.log(f"Now playing: {current.title} / {current.artist}")
+                        sent_key = current.key()
+                        last_state = None
+                        art_due = [now + t for t in self.ART_RETRY_AT]
+                        art_hash, art_frame, online_started = None, None, False
+                    state = (current.playing, current.can_seek, current.duration_ms, current.position_ms is None)
+                    if state != last_state or now - last_state_at >= 1.0:
+                        link.send(encode_state(current))
+                        last_state, last_state_at = state, now
+
+            # ---- album art
+            if art_due and now >= art_due[0] and current is not None and current.key() == sent_key:
+                art_due.pop(0)
+                data = None
+                try:
+                    data = self.media.get_art(current)
+                except Exception as e:
+                    if self.args.verbose:
+                        self.log("art error:", repr(e))
+                if data:
+                    h = hashlib.sha1(data).digest()
+                    if h != art_hash:
+                        try:
+                            art_frame = encode_art(data)
+                            link.send(art_frame)
+                            art_hash = h
+                        except Exception as e:
+                            if self.args.verbose:
+                                self.log("could not read the picture:", repr(e))
+                elif art_hash is None and not online_started and len(art_due) <= 2 and not self.args.no_online_art:
+                    online_started = True
+                    threading.Thread(target=self._online_art, args=(current,), daemon=True).start()
+
+            try:
+                key, data = self.online_results.get_nowait()
+            except queue.Empty:
+                key, data = None, None
+            if data and key == sent_key and art_hash is None:
+                try:
+                    online_frame = encode_art(data)
+                except Exception:
+                    online_frame = None
+                if online_frame:
+                    art_frame = online_frame
+                    link.send(art_frame)
+                    art_hash = hashlib.sha1(data).digest()
+
+            time.sleep(0.03)
+
+    def _online_art(self, np: NowPlaying):
+        self.online_results.put((np.key(), lookup_art_online(np)))
+
+    def command(self, cmd: str):
+        try:
+            if cmd == "PLAY":
+                self.media.play_pause()
+            elif cmd == "NEXT":
+                self.media.next()
+            elif cmd == "PREV":
+                self.media.previous()
+            elif cmd.startswith("SEEK:"):
+                self.media.seek(int(cmd[5:]))
+            if self.args.verbose:
+                self.log("display:", cmd)
+        except Exception as e:
+            self.log(f"Could not do '{cmd}': {e}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Send what's playing to the Desk Display.")
+    ap.add_argument("--port", help="serial port of the display, e.g. COM5 or /dev/cu.usbserial-110 (found automatically if left out)")
+    ap.add_argument("--demo", action="store_true", help="show fake tracks instead of real music, to test the display")
+    ap.add_argument("--app", help="Windows only: follow one app, e.g. --app applemusic (default: whatever Windows is showing)")
+    ap.add_argument("--no-online-art", action="store_true", help="never look covers up online when the music app has none")
+    ap.add_argument("--data-dir", default=os.path.dirname(os.path.abspath(__file__)),
+                    help="folder holding settings.json and reminders.txt (default: this folder)")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args()
+
+    try:
+        import serial  # noqa: F401
+        import PIL     # noqa: F401
+    except ImportError:
+        sys.exit("Missing packages. Run:  python -m pip install -r requirements.txt")
+
+    media = make_media(args)
+    try:
+        Companion(media, args).run()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+
+if __name__ == "__main__":
+    main()

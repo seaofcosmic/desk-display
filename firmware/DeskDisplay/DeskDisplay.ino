@@ -1,14 +1,19 @@
 // DeskDisplay - a now-playing screen for the ESP32 "Cheap Yellow Display" (ESP32-2432S028R).
 //
-// The board shows whatever the companion app on the computer sends over the USB cable:
-// album art, title, artist, a scrub gauge and prev / play-pause / next buttons.
-// Touches are sent back to the computer, which controls the music app.
+// The board shows whatever the companion app on the computer sends over the USB cable.
+// Swipe down anywhere to open the menu, then tap an app:
+//   MUSIC      album art, title, artist, a scrub gauge and prev / play-pause / next buttons
+//   CLOCK      time and date
+//   WEATHER    current conditions and the next days
+//   REMINDERS  a checklist from reminders.txt on the computer, with timed alerts
+// Touches are sent back to the computer, which controls the music app and the reminders file.
 //
 // Arduino IDE setup:
 //   Board:   "ESP32 Dev Module"      (install "esp32 by Espressif Systems" in Boards Manager)
 //   Library: "LovyanGFX"             (install from Library Manager)
 //
-// Look and layout live in ui.h. The USB message format lives in protocol.h.
+// Look and layout live in ui.h (music, shared pieces) and apps.h (menu and the other apps).
+// The USB message format lives in protocol.h.
 
 // ---------------------------------------------------------------- SETTINGS
 // Which screen chip the board has.
@@ -112,6 +117,7 @@
 #include <Preferences.h>
 #include "protocol.h"
 #include "ui.h"
+#include "apps.h"
 
 // ---------------------------------------------------------------- STATE
 static LGFX         lcd;
@@ -119,23 +125,38 @@ static UiState      ui;
 static uint8_t*     artBuf = nullptr;
 static FrameParser* parser = nullptr;
 
-static View     view        = VIEW_NOLINK;
+static App      app         = APP_MUSIC;   // which app is showing
+static bool     menuOpen    = false;
+static bool     alertOpen   = false;       // a reminder alert covers everything until tapped
+
+static bool     linkUp      = false;       // the computer is talking to us
 static bool     hasTrack    = false;
-static uint32_t lastFrameMs = 0;       // last valid message from the computer
+static uint32_t lastFrameMs = 0;           // last valid message from the computer
 static uint32_t lastByteMs  = 0;
 
-static uint32_t syncPosMs   = 0;       // position the computer last reported...
-static uint32_t syncAtMs    = 0;       // ...and when it reported it
-static uint32_t seekHoldUntil = 0;     // ignore reported position until then (after a scrub)
-static uint32_t playHoldUntil = 0;     // ignore reported play/pause until then (after a tap)
-
+static uint32_t syncPosMs   = 0;           // position the computer last reported...
+static uint32_t syncAtMs    = 0;           // ...and when it reported it
+static uint32_t seekHoldUntil = 0;         // ignore reported position until then (after a scrub)
+static uint32_t playHoldUntil = 0;         // ignore reported play/pause until then (after a tap)
 static bool     scrubbing   = false;
 static uint32_t scrubMs     = 0;
 static bool     barDirty    = true;
 
+static ClockState   clockState;
+static uint32_t     clockSyncEpoch = 0, clockSyncAtMs = 0, clockShownEpoch = 0;
+static Weather      weather;
+static ReminderList reminders;
+static int          remPage = 0;
+static Alert        alert;
+
 static const uint32_t LINK_TIMEOUT_MS = 5000;
 
 static bool before(uint32_t now, uint32_t deadline) { return (int32_t)(now - deadline) < 0; }
+
+static View musicView()           { return !linkUp ? VIEW_NOLINK : (hasTrack ? VIEW_PLAYING : VIEW_STANDBY); }
+static bool appVisible(App a)     { return !menuOpen && !alertOpen && app == a; }
+static bool playingVisible()      { return appVisible(APP_MUSIC) && musicView() == VIEW_PLAYING; }
+static uint32_t clockNow(uint32_t now) { return clockSyncEpoch + (now - clockSyncAtMs) / 1000; }
 
 static uint32_t currentPosMs(uint32_t now) {
   if (scrubbing) return scrubMs;
@@ -145,28 +166,47 @@ static uint32_t currentPosMs(uint32_t now) {
   return p;
 }
 
-static void setView(View v) {
-  view = v;
+// Redraws the whole screen for whatever should be showing right now.
+static void showCurrent() {
+  uint32_t now = millis();
   scrubbing = false;
   ui.pressed = ZONE_NONE;
-  lcd.setBrightness(v == VIEW_NOLINK ? 70 : 255);
-  if (v == VIEW_NOLINK)       drawNoLink();
-  else if (v == VIEW_STANDBY) drawStandby();
-  else {
-    ui.posMs = currentPosMs(millis());
-    drawPlayingScreen(ui);
-    barDirty = false;
+  lcd.setBrightness((appVisible(APP_MUSIC) && !linkUp) ? 70 : 255);
+
+  if (alertOpen) { drawAlert(alert); return; }
+  if (menuOpen)  { drawMenu(app); return; }
+
+  switch (app) {
+    case APP_CLOCK:
+      clockState.epoch = clockShownEpoch = clockNow(now);
+      drawClockScreen(clockState);
+      break;
+    case APP_WEATHER:
+      drawWeatherScreen(weather);
+      break;
+    case APP_REMINDERS:
+      if (remPage >= reminderPages(reminders)) remPage = 0;
+      drawRemindersScreen(reminders, remPage);
+      break;
+    default:
+      if (musicView() == VIEW_NOLINK)       drawNoLink();
+      else if (musicView() == VIEW_STANDBY) drawStandby();
+      else {
+        ui.posMs = currentPosMs(now);
+        drawPlayingScreen(ui);
+        barDirty = false;
+      }
   }
 }
 
-// ---------------------------------------------------------------- MESSAGES FROM THE COMPUTER
-static void copyField(char* dst, size_t n, const char*& p) {
-  size_t i = 0;
-  while (*p && *p != '\n') { if (i + 1 < n) dst[i++] = *p; ++p; }
-  dst[i] = 0;
-  if (*p == '\n') ++p;
+static void rememberApp() {
+  Preferences prefs;
+  prefs.begin("deskdisplay", false);
+  prefs.putUChar("app", (uint8_t)app);
+  prefs.end();
 }
 
+// ---------------------------------------------------------------- MESSAGES FROM THE COMPUTER
 static void handleFrame() {
   uint32_t now = millis();
   uint8_t type = parser->type();
@@ -174,34 +214,36 @@ static void handleFrame() {
   if (!parser->ok()) {
     if (type == 'A') {                       // damaged picture: drop it and ask again
       ui.artValid = false;
-      if (view == VIEW_PLAYING) drawArt(ui);
+      if (playingVisible()) drawArt(ui);
       Serial.print("DT:NAK:A\n");
     }
     return;
   }
+
+  View viewBefore = musicView();
+  bool partial = playingVisible();           // the now-playing screen is up: update just the changed part
   lastFrameMs = now;
+  linkUp = true;
+  const char* text = (const char*)parser->payload();
 
   switch (type) {
     case 'H':
       Serial.print("DT:READY:1\n");
-      return;
+      break;
 
-    case 'M': {
-      const char* p = (const char*)parser->payload();
-      copyField(ui.title,  sizeof ui.title,  p);
-      copyField(ui.artist, sizeof ui.artist, p);
-      copyField(ui.album,  sizeof ui.album,  p);
+    case 'M':
+      takeLine(ui.title,  sizeof ui.title,  text);
+      takeLine(ui.artist, sizeof ui.artist, text);
+      takeLine(ui.album,  sizeof ui.album,  text);
       ui.artValid = false;
       hasTrack = true;
       syncPosMs = 0; syncAtMs = now; seekHoldUntil = 0;
       scrubbing = false;
-      if (view != VIEW_PLAYING) setView(VIEW_PLAYING);
-      else { drawArt(ui); drawTrackText(ui); barDirty = true; }
-      return;
-    }
+      if (partial) { drawArt(ui); drawTrackText(ui); barDirty = true; }
+      break;
 
     case 'S': {
-      if (parser->length() < 9) return;
+      if (parser->length() < 9) break;
       const uint8_t* p = parser->payload();
       uint8_t flags = p[0];
       bool playing = flags & STATE_PLAYING;
@@ -221,26 +263,55 @@ static void handleFrame() {
       ui.canSeek = flags & STATE_CAN_SEEK;
       ui.durMs   = readU32(p + 5);
       if (!ui.canSeek) scrubbing = false;
-
-      if (!hasTrack) return;                  // wait for track info before showing anything
-      if (view != VIEW_PLAYING) { setView(VIEW_PLAYING); return; }
-      if (ui.playing != wasPlaying) { drawStatusLabel(ui); drawButton(ZONE_PLAY, ui); }
-      barDirty = true;
-      return;
+      if (partial) {
+        if (ui.playing != wasPlaying) { drawStatusLabel(ui); drawButton(ZONE_PLAY, ui); }
+        barDirty = true;
+      }
+      break;
     }
 
     case 'A':
       ui.artValid = true;
-      if (view == VIEW_PLAYING) drawArt(ui);
-      return;
+      if (partial) drawArt(ui);
+      break;
 
     case 'X':
       hasTrack = false;
       ui.artValid = false;
       ui.title[0] = ui.artist[0] = ui.album[0] = 0;
-      if (view != VIEW_STANDBY) setView(VIEW_STANDBY);
-      return;
+      break;
+
+    case 'T': {
+      if (parser->length() < 5) break;
+      const uint8_t* p = parser->payload();
+      bool wasKnown = clockState.known;
+      bool was24 = clockState.h24;
+      clockSyncEpoch = readU32(p);
+      clockSyncAtMs  = now;
+      clockState.h24 = p[4] & 0x01;
+      clockState.known = true;
+      if (appVisible(APP_CLOCK) && (!wasKnown || was24 != clockState.h24)) showCurrent();
+      break;
+    }
+
+    case 'W':
+      parseWeather(text, weather);
+      if (appVisible(APP_WEATHER)) showCurrent();
+      break;
+
+    case 'R':
+      parseReminders(text, reminders);
+      if (appVisible(APP_REMINDERS)) showCurrent();
+      break;
+
+    case 'N':
+      parseAlert(text, alert);
+      alertOpen = true;
+      showCurrent();
+      break;
   }
+
+  if (appVisible(APP_MUSIC) && musicView() != viewBefore) showCurrent();
 }
 
 static void readSerial() {
@@ -257,10 +328,61 @@ static void readSerial() {
 }
 
 // ---------------------------------------------------------------- TOUCH
+// Buttons and the scrub gauge react the moment they are touched. Everywhere else a touch is a
+// "gesture": it is judged when the finger lifts, as a tap, a swipe down (open the menu) or a
+// swipe up (close the menu).
+static bool gesture = false;
+static int  startX = 0, startY = 0;
+static int  trailX[3] = { 0, 0, 0 }, trailY[3] = { 0, 0, 0 };
+static int  trailLen = 0;
+static int  pressedTile = -1;
+
+static const int SWIPE_MIN = 45;     // pixels a finger must travel to count as a swipe
+static const int TAP_MAX   = 18;     // pixels a finger may wander and still count as a tap
+
+static void onTap(int x, int y) {
+  if (menuOpen) {
+    int t = menuTileAt(x, y);
+    if (t >= 0) {
+      app = (App)t;
+      menuOpen = false;
+      rememberApp();
+      showCurrent();
+    }
+    return;
+  }
+  if (app == APP_REMINDERS && reminders.valid) {
+    int i = reminderAt(reminders, remPage, y);
+    if (i == -2) {
+      int pages = reminderPages(reminders);
+      if (pages > 1) { remPage = (remPage + 1) % pages; showCurrent(); }
+    } else if (i >= 0) {
+      Reminder& it = reminders.items[i];
+      it.done = !it.done;                     // show the change right away
+      drawReminderRow(reminders, remPage, i);
+      Serial.printf("DT:CMD:REM:%d\n", i);
+    }
+  }
+}
+
 static void onPress(int x, int y) {
-  if (view != VIEW_PLAYING) return;
   uint32_t now = millis();
+  startX = x; startY = y;
+  trailX[0] = x; trailY[0] = y; trailLen = 1;
+  pressedTile = -1;
+  gesture = true;
+  if (alertOpen) return;
+
+  if (menuOpen) {
+    pressedTile = menuTileAt(x, y);
+    if (pressedTile >= 0) drawMenuTile(pressedTile, pressedTile == app, true);
+    return;
+  }
+  if (!playingVisible()) return;
+
   Zone z = zoneAt(x, y);
+  if (z == ZONE_NONE) return;
+  gesture = false;                            // a button or the gauge: act now
 
   if (z == ZONE_BAR) {
     if (ui.canSeek && ui.hasPos && ui.durMs > 0) {
@@ -270,8 +392,6 @@ static void onPress(int x, int y) {
     }
     return;
   }
-  if (z == ZONE_NONE) return;
-
   ui.pressed = z;
   if (z == ZONE_PLAY) {
     syncPosMs = currentPosMs(now); syncAtMs = now;
@@ -288,27 +408,59 @@ static void onPress(int x, int y) {
 }
 
 static void onDrag(int x, int y) {
-  (void)y;
+  if (trailLen < 3) { trailX[trailLen] = x; trailY[trailLen] = y; ++trailLen; }
+  else { trailX[0] = trailX[1]; trailY[0] = trailY[1]; trailX[1] = trailX[2]; trailY[1] = trailY[2]; trailX[2] = x; trailY[2] = y; }
+
   if (scrubbing) {
     uint32_t ms = barMsFromX(x, ui.durMs);
     if (ms != scrubMs) { scrubMs = ms; barDirty = true; }
+  }
+  if (pressedTile >= 0 && (abs(x - startX) > TAP_MAX || abs(y - startY) > TAP_MAX)) {
+    if (menuOpen) drawMenuTile(pressedTile, pressedTile == app, false);
+    pressedTile = -1;
   }
 }
 
 static void onRelease() {
   uint32_t now = millis();
-  if (scrubbing) {
-    scrubbing = false;
-    syncPosMs = scrubMs; syncAtMs = now;
-    seekHoldUntil = now + 2000;
-    Serial.printf("DT:CMD:SEEK:%lu\n", (unsigned long)scrubMs);
-    barDirty = true;
+  if (!gesture) {
+    if (scrubbing) {
+      scrubbing = false;
+      syncPosMs = scrubMs; syncAtMs = now;
+      seekHoldUntil = now + 2000;
+      Serial.printf("DT:CMD:SEEK:%lu\n", (unsigned long)scrubMs);
+      barDirty = true;
+    }
+    if (ui.pressed != ZONE_NONE) {
+      int z = ui.pressed;
+      ui.pressed = ZONE_NONE;
+      if (playingVisible()) drawButton(z, ui);
+    }
+    return;
   }
-  if (ui.pressed != ZONE_NONE) {
-    int z = ui.pressed;
-    ui.pressed = ZONE_NONE;
-    if (view == VIEW_PLAYING) drawButton(z, ui);
+  gesture = false;
+
+  if (alertOpen) {                            // any touch dismisses an alert
+    alertOpen = false;
+    showCurrent();
+    return;
   }
+
+  // The very last reading as a finger lifts is often off, so use the one before it.
+  int k = trailLen >= 3 ? 1 : trailLen - 1;
+  int dx = trailX[k] - startX, dy = trailY[k] - startY;
+
+  if (dy >= SWIPE_MIN && abs(dx) < 120) {
+    if (!menuOpen) { menuOpen = true; showCurrent(); }
+    else if (pressedTile >= 0) drawMenuTile(pressedTile, pressedTile == app, false);
+  } else if (dy <= -SWIPE_MIN && abs(dx) < 120) {
+    if (menuOpen) { menuOpen = false; showCurrent(); }
+  } else if (abs(dx) <= TAP_MAX && abs(dy) <= TAP_MAX) {
+    onTap(startX, startY);
+  } else if (menuOpen && pressedTile >= 0) {
+    drawMenuTile(pressedTile, pressedTile == app, false);
+  }
+  pressedTile = -1;
 }
 
 static void handleTouch() {
@@ -354,6 +506,8 @@ static void setupTouchCalibration() {
     lcd.calibrateTouch(cal, COL_AMBER, COL_BG, 18);
     prefs.putBytes("cal", cal, sizeof cal);
   }
+  uint8_t saved = prefs.getUChar("app", 0);
+  app = (App)(saved < APP_COUNT ? saved : 0);
   prefs.end();
 }
 
@@ -386,8 +540,7 @@ void setup() {
   drawMessageScreen("DESK DISPLAY", "Starting up.", "Hold the screen to redo touch setup.");
   setupTouchCalibration();
 
-  lastFrameMs = millis() - LINK_TIMEOUT_MS;
-  setView(VIEW_NOLINK);
+  showCurrent();
   Serial.print("\nDT:READY:1\n");
 }
 
@@ -397,9 +550,12 @@ void loop() {
 
   uint32_t now = millis();
 
-  if (view != VIEW_NOLINK && now - lastFrameMs > LINK_TIMEOUT_MS) setView(VIEW_NOLINK);
+  if (linkUp && now - lastFrameMs > LINK_TIMEOUT_MS) {
+    linkUp = false;
+    if (appVisible(APP_MUSIC)) showCurrent();
+  }
 
-  if (view == VIEW_PLAYING) {
+  if (playingVisible()) {
     static uint32_t lastBarMs = 0;
     static uint32_t shownSec = 0xFFFFFFFF;
     static int shownPx = -1;
@@ -413,6 +569,19 @@ void loop() {
       lastBarMs = now;
       shownSec = pos / 1000;
       shownPx = px;
+    }
+  }
+
+  if (appVisible(APP_CLOCK) && clockState.known) {
+    uint32_t e = clockNow(now);
+    if (e != clockShownEpoch) {
+      clockState.epoch = e;
+      if (e / 60 != clockShownEpoch / 60) {
+        drawClockTime(clockState);
+        if (e / 86400 != clockShownEpoch / 86400) drawClockDate(clockState);
+      }
+      drawClockSeconds(clockState);
+      clockShownEpoch = e;
     }
   }
 }
