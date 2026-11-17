@@ -2,6 +2,7 @@
 // Uses the colors, fonts and helpers from ui.h.
 #pragma once
 #include "ui.h"
+#include "scene.h"
 #include <time.h>
 #include <stdlib.h>
 
@@ -21,6 +22,7 @@ struct Weather {
   char city[28] = "", temp[8] = "", unit[4] = "F", cond[28] = "";
   int  icon = 2;
   char hi[8] = "", lo[8] = "", feels[8] = "", wind[14] = "", hum[8] = "", updated[12] = "";
+  bool night = false;
   WeatherDay days[3];
 };
 
@@ -57,8 +59,9 @@ struct Stats {
 
 // Everything the Settings app can change. Saved on the board.
 struct Settings {
-  uint8_t version     = 1;
-  bool albumColors    = true;    // MUSIC: color the music screen from the album cover
+  uint8_t version     = 2;
+  bool fullColor      = true;    // DISPLAY: the look. false = Minimal (amber), true = Full color
+  bool albumColors    = true;    // MUSIC: in Full color, take the music screen's colors from the cover
   bool h24            = false;   // CLOCK: 24-hour time (also used for times in other apps)
   bool weatherC       = false;   // WEATHER: Celsius instead of Fahrenheit
   bool reminderAlerts = true;    // REMINDERS: full-screen alert for timed reminders
@@ -82,7 +85,7 @@ static void takeLine(char* dst, size_t n, const char*& p) {       // up to the e
   if (*p == '\n') ++p;
 }
 
-// "OK" city temp unit condition icon high low feels wind humidity updated, one per line,
+// "OK" city temp unit condition icon high low feels wind humidity updated D-or-N (day/night), one per line,
 // then up to three lines of "day|icon|high|low".   Or: "ERR" and a message line.
 static void parseWeather(const char* p, Weather& w) {
   char tmp[16];
@@ -104,6 +107,7 @@ static void parseWeather(const char* p, Weather& w) {
   takeLine(w.wind, sizeof w.wind, p);
   takeLine(w.hum, sizeof w.hum, p);
   takeLine(w.updated, sizeof w.updated, p);
+  takeLine(tmp, sizeof tmp, p); w.night = (tmp[0] == 'N');
   for (int i = 0; i < 3; ++i) {
     WeatherDay& d = w.days[i];
     takeField(d.name, sizeof d.name, p);
@@ -165,21 +169,40 @@ static void parseAlert(const char* p, Alert& a) {
   takeLine(a.text, sizeof a.text, p);
 }
 
+// ---------------------------------------------------------------- the two looks
+// Minimal: every screen uses the amber THEME. Full color: each app has its own color, the
+// Weather app gets an animated sky, the Clock follows the time of day, and Music follows the cover.
+static bool fullColorMode = false;
+
+static const float APP_HUE[APP_COUNT] = { 38, 265, 208, 140, 5, 178, 215 };
+static const float APP_SAT[APP_COUNT] = { 0.85f, 0.60f, 0.75f, 0.55f, 0.70f, 0.60f, 0.15f };
+static Palette appPalette(int app) { return paletteFromHS(APP_HUE[app], APP_SAT[app]); }
+static Palette menuPalette()       { return paletteFromHS(220, 0.12f); }
+
+// Dawn is warm, day is blue, dusk is purple, night is deep blue.
+static Palette clockPalette(uint32_t epoch) {
+  int hour = (int)((epoch / 3600) % 24);
+  if (hour >= 5 && hour < 8)   return paletteFromHS(22, 0.75f);
+  if (hour >= 8 && hour < 17)  return paletteFromHS(208, 0.70f);
+  if (hour >= 17 && hour < 20) return paletteFromHS(300, 0.50f);
+  return paletteFromHS(232, 0.60f);
+}
+
 // ---------------------------------------------------------------- shared pieces
 static void drawHeader(const char* title, const char* right = nullptr) {
   drawPullHandle();
   gfx->setFont(FONT_SMALL);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
-  gfx->fillRect(8, 12, 7, 7, COL_AMBER);
-  gfx->setTextColor(COL_AMBER, COL_BG);
+  gfx->fillRect(8, 12, 7, 7, pal.accent);
+  gfx->setTextColor(pal.accent, pal.bg);
   gfx->drawString(title, 20, 12);
   if (right) {
     gfx->setTextDatum(lgfx::textdatum_t::top_right);
-    gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+    gfx->setTextColor(pal.dim, pal.bg);
     gfx->drawString(right, SCREEN_W - 8, 12);
     gfx->setTextDatum(lgfx::textdatum_t::top_left);
   }
-  gfx->drawFastHLine(8, 24, SCREEN_W - 16, COL_AMBER_DIM);
+  gfx->drawFastHLine(8, 24, SCREEN_W - 16, pal.dim);
 }
 
 static void thickLine(int x0, int y0, int x1, int y1, uint32_t col) {
@@ -312,13 +335,14 @@ static void drawAppIcon(int i, int cx, int cy, uint32_t ink, uint32_t face) {
 
 static void drawMenuTile(int i, bool selected, bool pressed) {
   int x = TILE_X[i % 3], y = TILE_Y[i / 3];
-  uint32_t face = pressed ? COL_CREAM : (selected ? COL_AMBER : COL_BG);
-  uint32_t ink  = (pressed || selected) ? COL_BG : COL_AMBER;
+  uint32_t color = fullColorMode ? appPalette(i).accent : pal.accent;    // each app's own color
+  uint32_t face = pressed ? pal.cream : (selected ? color : pal.bg);
+  uint32_t ink  = (pressed || selected) ? pal.bg : color;
   gfx->startWrite();
   gfx->fillRect(x, y, TILE_W, TILE_H, face);
   if (!pressed && !selected) {
-    gfx->drawRect(x, y, TILE_W, TILE_H, COL_AMBER);
-    gfx->drawRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2, COL_AMBER);
+    gfx->drawRect(x, y, TILE_W, TILE_H, color);
+    gfx->drawRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2, color);
   }
   drawAppIcon(i, x + TILE_W / 2, y + 22, ink, face);
   gfx->setFont(FONT_BODY);
@@ -330,7 +354,7 @@ static void drawMenuTile(int i, bool selected, bool pressed) {
 }
 
 static void drawMenu(int currentApp) {
-  gfx->fillScreen(COL_BG);
+  gfx->fillScreen(pal.bg);
   drawHeader("MENU", "SWIPE UP TO GO BACK");
   for (int i = 0; i < APP_COUNT; ++i) drawMenuTile(i, i == currentApp, false);
 }
@@ -354,7 +378,7 @@ static void drawClockTime(const ClockState& c) {
   snprintf(t, sizeof t, c.h24 ? "%02d:%02d" : "%d:%02d", h, tmv.tm_min);
 
   gfx->startWrite();
-  gfx->fillRect(0, CLOCK_TIME_Y, SCREEN_W, CLOCK_TIME_H, COL_BG);
+  gfx->fillRect(0, CLOCK_TIME_Y, SCREEN_W, CLOCK_TIME_H, pal.bg);
   gfx->setFont(&fonts::Font7);
   gfx->setTextSize(2);
   int tw = gfx->textWidth(t);
@@ -366,12 +390,12 @@ static void drawClockTime(const ClockState& c) {
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->setFont(&fonts::Font7);
   gfx->setTextSize(2);
-  gfx->setTextColor(COL_CREAM, COL_BG);
+  gfx->setTextColor(pal.cream, pal.bg);
   gfx->drawString(t, x, CLOCK_TIME_Y);
   gfx->setTextSize(1);
   if (ampm) {
     gfx->setFont(FONT_BIG);
-    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->setTextColor(pal.accent, pal.bg);
     gfx->drawString(ampm, x + tw + 8, CLOCK_TIME_Y + 72);
   }
   gfx->endWrite();
@@ -381,14 +405,14 @@ static void drawClockTime(const ClockState& c) {
 static void drawClockSeconds(const ClockState& c) {
   struct tm tmv; clockParts(c.epoch, tmv);
   LGFX_Sprite& b = *barSprite;
-  b.fillScreen(COL_BG);
+  b.fillScreen(pal.bg);
   for (int i = 0; i < 60; ++i)
-    b.fillRect(10 + i * 5, 6, 4, (i % 5 == 0) ? 16 : 12, i <= tmv.tm_sec ? COL_AMBER : COL_RUST);
+    b.fillRect(10 + i * 5, 6, 4, (i % 5 == 0) ? 16 : 12, i <= tmv.tm_sec ? pal.accent : pal.rust);
   char t[8];
   snprintf(t, sizeof t, ":%02d", tmv.tm_sec);
   b.setFont(FONT_BODY);
   b.setTextDatum(lgfx::textdatum_t::top_right);
-  b.setTextColor(COL_AMBER_DIM, COL_BG);
+  b.setTextColor(pal.dim, pal.bg);
   b.drawString(t, SCREEN_W - 10, 26);
   b.pushSprite(0, CLOCK_GAUGE_Y);
 }
@@ -398,10 +422,10 @@ static void drawClockDate(const ClockState& c) {
   char d[40];
   snprintf(d, sizeof d, "%s  %s %d", DAY_NAMES[tmv.tm_wday % 7], MONTH_NAMES[tmv.tm_mon % 12], tmv.tm_mday);
   gfx->startWrite();
-  gfx->fillRect(0, CLOCK_DATE_Y, SCREEN_W, SCREEN_H - CLOCK_DATE_Y, COL_BG);
+  gfx->fillRect(0, CLOCK_DATE_Y, SCREEN_W, SCREEN_H - CLOCK_DATE_Y, pal.bg);
   gfx->setFont(FONT_BIG);
   gfx->setTextDatum(lgfx::textdatum_t::top_center);
-  gfx->setTextColor(COL_AMBER, COL_BG);
+  gfx->setTextColor(pal.accent, pal.bg);
   gfx->drawString(d, SCREEN_W / 2, CLOCK_DATE_Y);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->endWrite();
@@ -412,7 +436,7 @@ static void drawClockScreen(const ClockState& c) {
     drawMessageScreen("NO SIGNAL", "The clock starts when the", "computer connects.", MENU_HINT);
     return;
   }
-  gfx->fillScreen(COL_BG);
+  gfx->fillScreen(pal.bg);
   drawHeader("CLOCK");
   drawClockTime(c);
   drawClockSeconds(c);
@@ -422,62 +446,163 @@ static void drawClockScreen(const ClockState& c) {
 // ---------------------------------------------------------------- WEATHER
 static void drawStatCell(int x, int y, const char* label, const char* value, uint32_t valueCol) {
   gfx->setFont(FONT_SMALL);
-  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->setTextColor(pal.dim, pal.bg);
   gfx->drawString(label, x, y);
   gfx->setFont(FONT_TITLE);
-  gfx->setTextColor(valueCol, COL_BG);
+  gfx->setTextColor(valueCol, pal.bg);
   gfx->drawString(value, x, y + 12);
 }
+
+// Minimal look: an icon, the temperature and the conditions.
+static void drawWeatherNow(const Weather& w) {
+  char buf[40];
+  drawWeatherIcon(w.icon, 46, 64, 64, pal.accent, pal.cream, pal.bg);
+  gfx->setFont(&fonts::Font7);
+  gfx->setTextColor(pal.cream, pal.bg);
+  gfx->drawString(w.temp, 96, 36);
+  int tx = 96 + gfx->textWidth(w.temp) + 10;
+  gfx->drawCircle(tx, 42, 5, pal.accent);
+  gfx->drawCircle(tx, 42, 4, pal.accent);
+  gfx->setFont(FONT_BIG);
+  gfx->setTextColor(pal.accent, pal.bg);
+  gfx->drawString(w.unit, tx + 9, 38);
+
+  gfx->setFont(FONT_TITLE);
+  gfx->setTextColor(pal.cream, pal.bg);
+  drawWrapped(w.cond, 12, 102, 190, 1, 20);
+  snprintf(buf, sizeof buf, "H %s   L %s", w.hi, w.lo);
+  gfx->setFont(FONT_BODY);
+  gfx->setTextDatum(lgfx::textdatum_t::top_right);
+  gfx->setTextColor(pal.accent, pal.bg);
+  gfx->drawString(buf, SCREEN_W - 10, 104);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+}
+
+// ---- Full color look: the whole screen is the animated sky. Swiping up shows the details
+// ---- on a blurred copy of that sky.
+static SceneState weatherScene;
+
+static SceneInfo weatherSceneInfo(const Weather& w) {
+  SceneInfo info;
+  info.kind = w.icon; info.night = w.night;
+  info.city = w.city; info.temp = w.temp; info.unit = w.unit; info.cond = w.cond; info.hi = w.hi; info.lo = w.lo;
+  return info;
+}
+
+// Draws the sky. advance = true also moves the clouds, rain and so on by one step.
+static void drawWeatherSky(const Weather& w, bool advance) {
+  if (weatherScene.kind != w.icon || weatherScene.night != w.night) sceneStart(weatherScene, w.icon, w.night);
+  else if (advance) sceneStep(weatherScene);
+  sceneDraw(weatherScene, weatherSceneInfo(w));
+}
+
+static void drawWeatherDetails(const Weather& w) {
+  static const uint32_t WHITE = 0xFFFFFF, SOFT = 0xC9D6E6, LINE = 0x7C8A9E, ICON_BG = 0x151B26;
+  char buf[40];
+
+  // the backdrop: the sky alone, out of focus and darkened
+  if (weatherScene.kind != w.icon || weatherScene.night != w.night) sceneStart(weatherScene, w.icon, w.night);
+  sceneDraw(weatherScene, weatherSceneInfo(w), false, false);
+  if (!sceneBlurToScreen(gfx, 45)) gfx->fillScreen(pal.bg);
+
+  gfx->startWrite();
+  gfx->fillRect(SCREEN_W / 2 - 22, 1, 44, 3, SOFT);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->setFont(FONT_SMALL);
+  gfx->setTextColor(SOFT);
+  gfx->drawString(w.city, 12, 12);
+  snprintf(buf, sizeof buf, "UPDATED %s", w.updated);
+  gfx->setTextDatum(lgfx::textdatum_t::top_right);
+  if (w.updated[0]) gfx->drawString(buf, SCREEN_W - 10, 12);
+
+  // now
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->setFont(FONT_BIG);
+  gfx->setTextColor(WHITE);
+  gfx->drawString(w.temp, 12, 32);
+  int x = 12 + gfx->textWidth(w.temp) + 7;
+  gfx->drawCircle(x, 36, 3, WHITE);
+  gfx->drawCircle(x, 36, 4, WHITE);
+  gfx->drawString(w.unit, x + 7, 32);
+  x += 7 + gfx->textWidth(w.unit) + 14;
+  gfx->setFont(FONT_TITLE);
+  drawWrapped(w.cond, x, 35, SCREEN_W - x - 10, 1, 20);
+  gfx->drawFastHLine(10, 64, SCREEN_W - 20, LINE);
+
+  // details
+  static const char* const LABELS[4] = { "FEELS LIKE", "WIND", "HUMIDITY", "HIGH / LOW" };
+  snprintf(buf, sizeof buf, "%s / %s", w.hi, w.lo);
+  const char* values[4] = { w.feels, w.wind, w.hum, buf };
+  for (int i = 0; i < 4; ++i) {
+    int cx = 12 + (i % 2) * 156, cy = 74 + (i / 2) * 36;
+    gfx->setFont(FONT_SMALL);
+    gfx->setTextColor(SOFT);
+    gfx->drawString(LABELS[i], cx, cy);
+    gfx->setFont(FONT_TITLE);
+    gfx->setTextColor(WHITE);
+    gfx->drawString(values[i], cx, cy + 11);
+  }
+  gfx->drawFastHLine(10, 148, SCREEN_W - 20, LINE);
+
+  // next days
+  for (int i = 0; i < 3; ++i) {
+    const WeatherDay& d = w.days[i];
+    if (!d.name[0]) continue;
+    int dx = 8 + i * 104;
+    drawWeatherIcon(d.icon, dx + 15, 182, 30, 0xFFD23F, WHITE, ICON_BG);
+    gfx->setFont(FONT_SMALL);
+    gfx->setTextColor(SOFT);
+    gfx->drawString(d.name, dx + 34, 164);
+    snprintf(buf, sizeof buf, "%s / %s", d.hi, d.lo);
+    gfx->setFont(FONT_TITLE);
+    gfx->setTextColor(WHITE);
+    gfx->drawString(buf, dx + 34, 176);
+  }
+
+  gfx->setFont(FONT_SMALL);
+  gfx->setTextColor(SOFT);
+  gfx->setTextDatum(lgfx::textdatum_t::top_right);
+  gfx->drawString("SWIPE DOWN FOR THE SKY", SCREEN_W - 10, 226);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->endWrite();
+}
+
+// True when the Weather app should be the full-screen sky.
+static bool weatherImmersive(const Weather& w) { return fullColorMode && sceneReady && w.valid; }
 
 static void drawWeatherScreen(const Weather& w) {
   if (!w.valid) {
     drawMessageScreen("WEATHER", w.error, nullptr, MENU_HINT);
     return;
   }
+  if (weatherImmersive(w)) {
+    drawWeatherSky(w, false);
+    return;
+  }
   char buf[40];
   gfx->startWrite();
-  gfx->fillScreen(COL_BG);
+  gfx->fillScreen(pal.bg);
   snprintf(buf, sizeof buf, "UPDATED %s", w.updated);
   drawHeader(w.city[0] ? w.city : "WEATHER", w.updated[0] ? buf : nullptr);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
 
-  // now
-  drawWeatherIcon(w.icon, 46, 64, 64, COL_AMBER, COL_CREAM, COL_BG);
-  gfx->setFont(&fonts::Font7);
-  gfx->setTextColor(COL_CREAM, COL_BG);
-  gfx->drawString(w.temp, 96, 36);
-  int tx = 96 + gfx->textWidth(w.temp) + 10;
-  gfx->drawCircle(tx, 42, 5, COL_AMBER);
-  gfx->drawCircle(tx, 42, 4, COL_AMBER);
-  gfx->setFont(FONT_BIG);
-  gfx->setTextColor(COL_AMBER, COL_BG);
-  gfx->drawString(w.unit, tx + 9, 38);
-
-  gfx->setFont(FONT_TITLE);
-  gfx->setTextColor(COL_CREAM, COL_BG);
-  drawWrapped(w.cond, 12, 102, 190, 1, 20);
-  snprintf(buf, sizeof buf, "H %s   L %s", w.hi, w.lo);
-  gfx->setFont(FONT_BODY);
-  gfx->setTextDatum(lgfx::textdatum_t::top_right);
-  gfx->setTextColor(COL_AMBER, COL_BG);
-  gfx->drawString(buf, SCREEN_W - 10, 104);
-  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  drawWeatherNow(w);
+  gfx->drawFastHLine(8, 126, SCREEN_W - 16, pal.dim);
 
   // details
-  gfx->drawFastHLine(8, 126, SCREEN_W - 16, COL_AMBER_DIM);
-  drawStatCell(12, 133, "FEELS LIKE", w.feels, COL_AMBER);
-  drawStatCell(116, 133, "WIND", w.wind, COL_AMBER);
-  drawStatCell(220, 133, "HUMIDITY", w.hum, COL_AMBER);
+  drawStatCell(12, 133, "FEELS LIKE", w.feels, pal.accent);
+  drawStatCell(116, 133, "WIND", w.wind, pal.accent);
+  drawStatCell(220, 133, "HUMIDITY", w.hum, pal.accent);
 
   // next days
-  gfx->drawFastHLine(8, 172, SCREEN_W - 16, COL_AMBER_DIM);
+  gfx->drawFastHLine(8, 172, SCREEN_W - 16, pal.dim);
   for (int i = 0; i < 3; ++i) {
     const WeatherDay& d = w.days[i];
     if (!d.name[0]) continue;
     int x = 12 + i * 104;
-    drawWeatherIcon(d.icon, x + 14, 210, 28, COL_AMBER, COL_CREAM, COL_BG);
+    drawWeatherIcon(d.icon, x + 14, 210, 28, pal.accent, pal.cream, pal.bg);
     snprintf(buf, sizeof buf, "%s / %s", d.hi, d.lo);
-    drawStatCell(x + 34, 192, d.name, buf, COL_CREAM);
+    drawStatCell(x + 34, 192, d.name, buf, pal.cream);
   }
   gfx->endWrite();
 }
@@ -500,31 +625,31 @@ static void drawReminderRow(const ReminderList& r, int page, int i) {
   if (row < 0 || row >= REM_ROWS) return;
   int y = REM_ROW_Y + row * REM_ROW_H;
   gfx->startWrite();
-  gfx->fillRect(0, y, SCREEN_W, REM_ROW_H, COL_BG);
+  gfx->fillRect(0, y, SCREEN_W, REM_ROW_H, pal.bg);
   if (i < r.count) {
     const Reminder& it = r.items[i];
-    uint32_t col = it.done ? COL_AMBER_DIM : COL_CREAM;
+    uint32_t col = it.done ? pal.dim : pal.cream;
     int bx = 12, by = y + 9;
     if (it.done) {
-      gfx->fillRect(bx, by, 18, 18, COL_AMBER_DIM);
-      thickLine(bx + 4, by + 9, bx + 7, by + 13, COL_BG);
-      thickLine(bx + 7, by + 13, bx + 14, by + 4, COL_BG);
+      gfx->fillRect(bx, by, 18, 18, pal.dim);
+      thickLine(bx + 4, by + 9, bx + 7, by + 13, pal.bg);
+      thickLine(bx + 7, by + 13, bx + 14, by + 4, pal.bg);
     } else {
-      gfx->drawRect(bx, by, 18, 18, COL_AMBER);
-      gfx->drawRect(bx + 1, by + 1, 16, 16, COL_AMBER);
+      gfx->drawRect(bx, by, 18, 18, pal.accent);
+      gfx->drawRect(bx + 1, by + 1, 16, 16, pal.accent);
     }
     int right = SCREEN_W - 10;
     gfx->setFont(FONT_BODY);
     if (it.time[0]) {
       gfx->setTextDatum(lgfx::textdatum_t::top_right);
-      gfx->setTextColor(it.done ? COL_AMBER_DIM : COL_AMBER, COL_BG);
+      gfx->setTextColor(it.done ? pal.dim : pal.accent, pal.bg);
       gfx->drawString(it.time, right, y + 10);
       right -= gfx->textWidth(it.time) + 10;
       gfx->setTextDatum(lgfx::textdatum_t::top_left);
     }
-    gfx->setTextColor(col, COL_BG);
+    gfx->setTextColor(col, pal.bg);
     drawWrapped(it.text, 40, y + 10, right - 40, 1, BODY_LINE_H);
-    gfx->drawFastHLine(8, y + REM_ROW_H - 1, SCREEN_W - 16, COL_RUST);
+    gfx->drawFastHLine(8, y + REM_ROW_H - 1, SCREEN_W - 16, pal.rust);
   }
   gfx->endWrite();
 }
@@ -535,14 +660,14 @@ static void drawRemindersScreen(const ReminderList& r, int page) {
     return;
   }
   char buf[40];
-  gfx->fillScreen(COL_BG);
+  gfx->fillScreen(pal.bg);
   snprintf(buf, sizeof buf, "%d TO DO", r.open);
   drawHeader("REMINDERS", buf);
 
   if (r.count == 0) {
     gfx->setTextDatum(lgfx::textdatum_t::top_center);
     gfx->setFont(FONT_BIG);
-    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->setTextColor(pal.accent, pal.bg);
     gfx->drawString("ALL CLEAR", SCREEN_W / 2, 90);
     gfx->setFont(FONT_BODY);
     gfx->drawString("Add lines to reminders.txt", SCREEN_W / 2, 128);
@@ -553,14 +678,14 @@ static void drawRemindersScreen(const ReminderList& r, int page) {
   for (int row = 0; row < REM_ROWS; ++row) drawReminderRow(r, page, page * REM_ROWS + row);
 
   gfx->setFont(FONT_SMALL);
-  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->setTextColor(pal.dim, pal.bg);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->drawString("TAP TO CHECK OFF", 12, REM_FOOT_Y + 12);
   int pages = reminderPages(r);
   if (pages > 1) {
     snprintf(buf, sizeof buf, "PAGE %d/%d  TAP HERE FOR MORE", page + 1, pages);
     gfx->setTextDatum(lgfx::textdatum_t::top_right);
-    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->setTextColor(pal.accent, pal.bg);
     gfx->drawString(buf, SCREEN_W - 10, REM_FOOT_Y + 12);
     gfx->setTextDatum(lgfx::textdatum_t::top_left);
   }
@@ -572,13 +697,13 @@ static int eventPages(const EventList& e) { return e.count <= LIST_ROWS ? 1 : (e
 static void drawListFooter(const char* left, int page, int pages) {
   char buf[40];
   gfx->setFont(FONT_SMALL);
-  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->setTextColor(pal.dim, pal.bg);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->drawString(left, 12, REM_FOOT_Y + 12);
   if (pages > 1) {
     snprintf(buf, sizeof buf, "PAGE %d/%d  TAP HERE FOR MORE", page + 1, pages);
     gfx->setTextDatum(lgfx::textdatum_t::top_right);
-    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->setTextColor(pal.accent, pal.bg);
     gfx->drawString(buf, SCREEN_W - 10, REM_FOOT_Y + 12);
     gfx->setTextDatum(lgfx::textdatum_t::top_left);
   }
@@ -589,12 +714,12 @@ static void drawCalendarScreen(const EventList& e, int page) {
     drawMessageScreen("CALENDAR", e.error, nullptr, MENU_HINT);
     return;
   }
-  gfx->fillScreen(COL_BG);
+  gfx->fillScreen(pal.bg);
   drawHeader("CALENDAR", "FROM NOTION");
   if (e.count == 0) {
     gfx->setTextDatum(lgfx::textdatum_t::top_center);
     gfx->setFont(FONT_BIG);
-    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->setTextColor(pal.accent, pal.bg);
     gfx->drawString("ALL CLEAR", SCREEN_W / 2, 90);
     gfx->setFont(FONT_BODY);
     gfx->drawString("Nothing in the next 7 days.", SCREEN_W / 2, 128);
@@ -609,14 +734,14 @@ static void drawCalendarScreen(const EventList& e, int page) {
     int y = REM_ROW_Y + row * REM_ROW_H;
     gfx->setTextDatum(lgfx::textdatum_t::top_left);
     gfx->setFont(FONT_SMALL);
-    gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+    gfx->setTextColor(pal.dim, pal.bg);
     gfx->drawString(it.day, 12, y + 5);
     gfx->setFont(FONT_BODY);
-    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->setTextColor(pal.accent, pal.bg);
     gfx->drawString(it.time, 12, y + 15);
-    gfx->setTextColor(COL_CREAM, COL_BG);
+    gfx->setTextColor(pal.cream, pal.bg);
     drawWrapped(it.title, 92, y + 10, SCREEN_W - 92 - 10, 1, BODY_LINE_H);
-    gfx->drawFastHLine(8, y + REM_ROW_H - 1, SCREEN_W - 16, COL_RUST);
+    gfx->drawFastHLine(8, y + REM_ROW_H - 1, SCREEN_W - 16, pal.rust);
   }
   gfx->endWrite();
   drawListFooter("NEXT 7 DAYS", page, eventPages(e));
@@ -638,25 +763,25 @@ static void drawSystemGauge(int row, const char* label, int percent, bool known)
   if (percent > 100) percent = 100;
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->setFont(FONT_SMALL);
-  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->setTextColor(pal.dim, pal.bg);
   gfx->drawString(label, 12, y + 8);
   int lit = known ? (percent * SYS_GAUGE_SEGS + 50) / 100 : 0;
   for (int i = 0; i < SYS_GAUGE_SEGS; ++i) {
     bool hot = i >= SYS_GAUGE_SEGS * 85 / 100;            // the last stretch of the gauge is the red line
-    gfx->fillRect(SYS_GAUGE_X + i * 8, y + 5, 6, 14, i < lit ? (hot ? COL_CREAM : COL_AMBER) : COL_RUST);
+    gfx->fillRect(SYS_GAUGE_X + i * 8, y + 5, 6, 14, i < lit ? (hot ? pal.cream : pal.accent) : pal.rust);
   }
-  gfx->fillRect(SYS_GAUGE_X + SYS_GAUGE_SEGS * 8 + 2, y, SCREEN_W - (SYS_GAUGE_X + SYS_GAUGE_SEGS * 8 + 2), SYS_ROW_H - 2, COL_BG);
+  gfx->fillRect(SYS_GAUGE_X + SYS_GAUGE_SEGS * 8 + 2, y, SCREEN_W - (SYS_GAUGE_X + SYS_GAUGE_SEGS * 8 + 2), SYS_ROW_H - 2, pal.bg);
   if (known) snprintf(buf, sizeof buf, "%d%%", percent); else snprintf(buf, sizeof buf, "--");
   gfx->setFont(FONT_TITLE);
   gfx->setTextDatum(lgfx::textdatum_t::top_right);
-  gfx->setTextColor(COL_AMBER, COL_BG);
+  gfx->setTextColor(pal.accent, pal.bg);
   gfx->drawString(buf, SCREEN_W - 10, y + 5);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
 }
 
 static void drawSystemCell(int x, int y, const char* label, const char* value) {
-  gfx->fillRect(x, y + 11, 100, 20, COL_BG);
-  drawStatCell(x, y, label, value, COL_AMBER);
+  gfx->fillRect(x, y + 11, 100, 20, pal.bg);
+  drawStatCell(x, y, label, value, pal.accent);
 }
 
 // The numbers only. Called again whenever they change, so nothing flickers.
@@ -683,23 +808,26 @@ static void drawSystemValues(const Stats& st, const Settings& set) {
 }
 
 static void drawSystemScreen(const Stats& st, const Settings& set) {
-  gfx->fillScreen(COL_BG);
+  gfx->fillScreen(pal.bg);
   drawHeader("SYSTEM", "COMPUTER");
-  gfx->drawFastHLine(8, 118, SCREEN_W - 16, COL_AMBER_DIM);
-  gfx->drawFastHLine(8, 162, SCREEN_W - 16, COL_AMBER_DIM);
+  gfx->drawFastHLine(8, 118, SCREEN_W - 16, pal.dim);
+  gfx->drawFastHLine(8, 162, SCREEN_W - 16, pal.dim);
   gfx->setFont(FONT_SMALL);
   gfx->setTextDatum(lgfx::textdatum_t::top_right);
-  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->setTextColor(pal.dim, pal.bg);
   gfx->drawString("THIS DISPLAY", SCREEN_W - 8, 168);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   drawSystemValues(st, set);
 }
 
 // ---------------------------------------------------------------- SETTINGS
-static const int SETTING_COUNT = 8;
-static const char* const SETTING_APP[SETTING_COUNT]  = { "MUSIC", "CLOCK", "WEATHER", "REMINDERS", "CALENDAR", "SYSTEM", "DISPLAY", "DISPLAY" };
+static const int SETTING_COUNT = 9;
+static const char* const SETTING_APP[SETTING_COUNT]  = {
+  "DISPLAY", "MUSIC, IN THE FULL COLOR LOOK", "CLOCK", "WEATHER", "REMINDERS", "CALENDAR", "SYSTEM", "DISPLAY", "DISPLAY",
+};
 static const char* const SETTING_NAME[SETTING_COUNT] = {
-  "Album colors", "Time format", "Temperature", "Timed alerts", "Alert before events", "Temperature", "Brightness", "Alert light on the back",
+  "Look", "Album colors", "Time format", "Temperature", "Timed alerts", "Alert before events", "Temperature", "Brightness",
+  "Alert light on the back",
 };
 
 static int settingsPages() { return (SETTING_COUNT + LIST_ROWS - 1) / LIST_ROWS; }
@@ -708,14 +836,15 @@ static int settingsPages() { return (SETTING_COUNT + LIST_ROWS - 1) / LIST_ROWS;
 static void settingValue(const Settings& s, int i, char* out, size_t n, bool& isSwitch, bool& on) {
   isSwitch = true; on = false;
   switch (i) {
-    case 0: on = s.albumColors; break;
-    case 1: isSwitch = false; snprintf(out, n, s.h24 ? "24 H" : "12 H"); return;
-    case 2: isSwitch = false; snprintf(out, n, s.weatherC ? "C" : "F"); return;
-    case 3: on = s.reminderAlerts; break;
-    case 4: on = s.eventAlerts; break;
-    case 5: isSwitch = false; snprintf(out, n, s.statsF ? "F" : "C"); return;
-    case 6: isSwitch = false; snprintf(out, n, "%d%%", (s.brightness + 1) * 25); return;
-    case 7: on = s.alertLight; break;
+    case 0: isSwitch = false; snprintf(out, n, s.fullColor ? "FULL COLOR" : "MINIMAL"); return;
+    case 1: on = s.albumColors; break;
+    case 2: isSwitch = false; snprintf(out, n, s.h24 ? "24 H" : "12 H"); return;
+    case 3: isSwitch = false; snprintf(out, n, s.weatherC ? "C" : "F"); return;
+    case 4: on = s.reminderAlerts; break;
+    case 5: on = s.eventAlerts; break;
+    case 6: isSwitch = false; snprintf(out, n, s.statsF ? "F" : "C"); return;
+    case 7: isSwitch = false; snprintf(out, n, "%d%%", (s.brightness + 1) * 25); return;
+    case 8: on = s.alertLight; break;
   }
   snprintf(out, n, on ? "ON" : "OFF");
 }
@@ -723,14 +852,15 @@ static void settingValue(const Settings& s, int i, char* out, size_t n, bool& is
 // Tapping a row moves it to its next value.
 static void settingAdvance(Settings& s, int i) {
   switch (i) {
-    case 0: s.albumColors = !s.albumColors; break;
-    case 1: s.h24 = !s.h24; break;
-    case 2: s.weatherC = !s.weatherC; break;
-    case 3: s.reminderAlerts = !s.reminderAlerts; break;
-    case 4: s.eventAlerts = !s.eventAlerts; break;
-    case 5: s.statsF = !s.statsF; break;
-    case 6: s.brightness = (s.brightness + 1) % 4; break;
-    case 7: s.alertLight = !s.alertLight; break;
+    case 0: s.fullColor = !s.fullColor; break;
+    case 1: s.albumColors = !s.albumColors; break;
+    case 2: s.h24 = !s.h24; break;
+    case 3: s.weatherC = !s.weatherC; break;
+    case 4: s.reminderAlerts = !s.reminderAlerts; break;
+    case 5: s.eventAlerts = !s.eventAlerts; break;
+    case 6: s.statsF = !s.statsF; break;
+    case 7: s.brightness = (s.brightness + 1) % 4; break;
+    case 8: s.alertLight = !s.alertLight; break;
   }
 }
 
@@ -745,24 +875,27 @@ static void drawSettingsRow(const Settings& s, int page, int i) {
   int row = i - page * LIST_ROWS;
   if (row < 0 || row >= LIST_ROWS || i >= SETTING_COUNT) return;
   int y = REM_ROW_Y + row * REM_ROW_H;
-  char val[10]; bool isSwitch, on;
+  char val[14]; bool isSwitch, on;
   settingValue(s, i, val, sizeof val, isSwitch, on);
 
   gfx->startWrite();
-  gfx->fillRect(0, y, SCREEN_W, REM_ROW_H, COL_BG);
+  gfx->fillRect(0, y, SCREEN_W, REM_ROW_H, pal.bg);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->setFont(FONT_SMALL);
-  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->setTextColor(pal.dim, pal.bg);
   gfx->drawString(SETTING_APP[i], 12, y + 5);
   gfx->setFont(FONT_BODY);
-  gfx->setTextColor(COL_CREAM, COL_BG);
+  gfx->setTextColor(pal.cream, pal.bg);
   gfx->drawString(SETTING_NAME[i], 12, y + 15);
 
-  int bw = 62, bh = 24, bx = SCREEN_W - 10 - bw, by = y + 6;
-  uint32_t face = (isSwitch && on) ? COL_AMBER : COL_BG;
-  uint32_t ink  = (isSwitch && on) ? COL_BG : ((isSwitch && !on) ? COL_AMBER_DIM : COL_AMBER);
+  gfx->setFont(FONT_TITLE);
+  int bw = gfx->textWidth(val) + 16;
+  if (bw < 62) bw = 62;
+  int bh = 24, bx = SCREEN_W - 10 - bw, by = y + 6;
+  uint32_t face = (isSwitch && on) ? pal.accent : pal.bg;
+  uint32_t ink  = (isSwitch && on) ? pal.bg : ((isSwitch && !on) ? pal.dim : pal.accent);
   gfx->fillRect(bx, by, bw, bh, face);
-  if (face == COL_BG) {
+  if (face == pal.bg) {
     gfx->drawRect(bx, by, bw, bh, ink);
     gfx->drawRect(bx + 1, by + 1, bw - 2, bh - 2, ink);
   }
@@ -771,12 +904,12 @@ static void drawSettingsRow(const Settings& s, int page, int i) {
   gfx->setTextColor(ink);
   gfx->drawString(val, bx + bw / 2, by + 4);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
-  gfx->drawFastHLine(8, y + REM_ROW_H - 1, SCREEN_W - 16, COL_RUST);
+  gfx->drawFastHLine(8, y + REM_ROW_H - 1, SCREEN_W - 16, pal.rust);
   gfx->endWrite();
 }
 
 static void drawSettingsScreen(const Settings& s, int page) {
-  gfx->fillScreen(COL_BG);
+  gfx->fillScreen(pal.bg);
   drawHeader("SETTINGS");
   for (int row = 0; row < LIST_ROWS; ++row) drawSettingsRow(s, page, page * LIST_ROWS + row);
   drawListFooter("TAP TO CHANGE", page, settingsPages());
@@ -785,18 +918,18 @@ static void drawSettingsScreen(const Settings& s, int page) {
 // ---------------------------------------------------------------- REMINDER ALERT
 static void drawAlert(const Alert& a) {
   gfx->startWrite();
-  gfx->fillScreen(COL_BG);
+  gfx->fillScreen(pal.bg);
   drawHazardBand(0, 16);
   drawHazardBand(SCREEN_H - 16, 16);
   gfx->setTextDatum(lgfx::textdatum_t::top_center);
   gfx->setFont(FONT_BIG);
-  gfx->setTextColor(COL_AMBER, COL_BG);
+  gfx->setTextColor(pal.accent, pal.bg);
   gfx->drawString(a.time[0] ? a.time : "REMINDER", SCREEN_W / 2, 40);
-  gfx->drawFastHLine(60, 72, SCREEN_W - 120, COL_AMBER_DIM);
-  gfx->setTextColor(COL_CREAM, COL_BG);
+  gfx->drawFastHLine(60, 72, SCREEN_W - 120, pal.dim);
+  gfx->setTextColor(pal.cream, pal.bg);
   drawWrapped(a.text, SCREEN_W / 2, 88, SCREEN_W - 40, 3, 28);
   gfx->setFont(FONT_SMALL);
-  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->setTextColor(pal.dim, pal.bg);
   gfx->drawString("TAP TO DISMISS", SCREEN_W / 2, 200);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->endWrite();

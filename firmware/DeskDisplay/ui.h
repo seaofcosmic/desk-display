@@ -56,6 +56,114 @@ struct UiState {
 static lgfx::LovyanGFX* gfx = nullptr;   // the screen
 static LGFX_Sprite*     barSprite = nullptr;
 
+// ---------------------------------------------------------------- palettes
+// Nothing draws with the THEME colors directly. Screens draw with a palette:
+//   pal       the palette of whatever screen is showing (menu, clock, weather, ...)
+//   musicPal  the palette of the music screen
+// In the Minimal look both are the THEME colors. In the Full color look each app gets its own
+// palette, and the music screen's is rebuilt from each album cover.
+struct Palette {
+  uint32_t bg, accent, dim, rust, cream;
+  bool operator==(const Palette& o) const { return bg == o.bg && accent == o.accent && dim == o.dim && rust == o.rust && cream == o.cream; }
+};
+static const Palette SYSTEM_PALETTE = { COL_BG, COL_AMBER, COL_AMBER_DIM, COL_RUST, COL_CREAM };
+static Palette musicPal = SYSTEM_PALETTE;
+static Palette pal = SYSTEM_PALETTE;
+
+// h in 0..360, s and l in 0..1  ->  0xRRGGBB
+static uint32_t hslColor(float h, float s, float l) {
+  float c = (1 - (l * 2 > 1 ? l * 2 - 1 : 1 - l * 2)) * s;
+  float hp = h / 60.0f;
+  float t = hp - 2 * (int)(hp / 2);
+  float x = c * (1 - (t > 1 ? t - 1 : 1 - t));
+  float r = 0, g = 0, b = 0;
+  switch (((int)hp) % 6) {
+    case 0: r = c; g = x; break;
+    case 1: r = x; g = c; break;
+    case 2: g = c; b = x; break;
+    case 3: g = x; b = c; break;
+    case 4: r = x; b = c; break;
+    default: r = c; b = x; break;
+  }
+  float m = l - c / 2;
+  int R = (int)((r + m) * 255 + 0.5f), G = (int)((g + m) * 255 + 0.5f), B = (int)((b + m) * 255 + 0.5f);
+  return ((uint32_t)R << 16) | ((uint32_t)G << 8) | (uint32_t)B;
+}
+
+static float luma(uint32_t c) {
+  return (0.299f * ((c >> 16) & 255) + 0.587f * ((c >> 8) & 255) + 0.114f * (c & 255)) / 255.0f;
+}
+
+// Same hue, but light enough to read: blues and purples need more lightness than yellows.
+static uint32_t hslReadable(float h, float s, float l, float minLuma) {
+  uint32_t c = hslColor(h, s, l);
+  while (luma(c) < minLuma && l < 0.88f) { l += 0.03f; c = hslColor(h, s, l); }
+  return c;
+}
+
+// A whole palette from one hue (0..360) and how colorful it should be (0..1):
+// a dark background, a bright accent, and the tones in between.
+static Palette paletteFromHS(float h, float s) {
+  Palette p;
+  p.bg     = hslColor(h, s * 0.60f, 0.09f);
+  p.rust   = hslColor(h, s * 0.55f, 0.19f);
+  p.dim    = hslReadable(h, s * 0.60f, 0.40f, 0.22f);
+  p.accent = hslReadable(h, s * 0.90f, 0.62f, 0.50f);
+  p.cream  = hslColor(h, s * 0.40f, 0.94f);
+  return p;
+}
+
+// Finds the cover's main color and builds a dark background, a bright accent and the in-between
+// tones from it. 'art' is ART_SIZE x ART_SIZE pixels of RGB565, high byte first.
+static Palette paletteFromArt(const uint8_t* art) {
+  static const int BINS = 24;
+  uint32_t weight[BINS] = { 0 }, sumR[BINS] = { 0 }, sumG[BINS] = { 0 }, sumB[BINS] = { 0 };
+  uint32_t samples = 0, colorful = 0;
+  for (int y = 0; y < ART_SIZE; y += 2) {
+    for (int x = 0; x < ART_SIZE; x += 2) {
+      const uint8_t* p = art + ((size_t)y * ART_SIZE + x) * 2;
+      uint16_t v = ((uint16_t)p[0] << 8) | p[1];
+      int r = ((v >> 11) & 31) * 255 / 31, g = ((v >> 5) & 63) * 255 / 63, b = (v & 31) * 255 / 31;
+      int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+      int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      int chroma = mx - mn;
+      ++samples;
+      if (chroma < 45 || mx < 55) continue;          // gray, black or white: no hue to speak of
+      float h;
+      if (mx == r)      h = 60.0f * (g - b) / chroma + (g < b ? 360.0f : 0.0f);
+      else if (mx == g) h = 60.0f * (b - r) / chroma + 120.0f;
+      else              h = 60.0f * (r - g) / chroma + 240.0f;
+      int bin = ((int)(h / (360.0f / BINS))) % BINS;
+      weight[bin] += chroma; sumR[bin] += r * chroma; sumG[bin] += g * chroma; sumB[bin] += b * chroma;
+      ++colorful;
+    }
+  }
+
+  float h = 0, s = 0;
+  if (colorful * 100 >= samples * 6) {
+    int best = 0; uint32_t bestScore = 0;
+    for (int i = 0; i < BINS; ++i) {
+      uint32_t score = weight[i] * 2 + weight[(i + 1) % BINS] + weight[(i + BINS - 1) % BINS];
+      if (score > bestScore) { bestScore = score; best = i; }
+    }
+    float r = (float)sumR[best] / weight[best], g = (float)sumG[best] / weight[best], b = (float)sumB[best] / weight[best];
+    float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    float mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    float c = mx - mn;
+    if (c > 1) {
+      if (mx == r)      h = 60.0f * (g - b) / c + (g < b ? 360.0f : 0.0f);
+      else if (mx == g) h = 60.0f * (b - r) / c + 120.0f;
+      else              h = 60.0f * (r - g) / c + 240.0f;
+      float l = (mx + mn) / 510.0f;
+      float d = 1 - (l * 2 > 1 ? l * 2 - 1 : 1 - l * 2);
+      s = d > 0.01f ? (c / 255.0f) / d : 0;
+      if (s > 1) s = 1;
+    }
+  }
+
+  return paletteFromHS(h, s);
+}
+
 // ---------------------------------------------------------------- helpers
 static void uiBegin(lgfx::LovyanGFX* screen) {
   gfx = screen;
@@ -131,38 +239,38 @@ static int drawWrapped(const char* text, int x, int y, int maxW, int maxLines, i
 }
 
 static void drawHazardBand(int y, int h) {
-  gfx->fillRect(0, y, SCREEN_W, h, COL_BG);
+  gfx->fillRect(0, y, SCREEN_W, h, pal.bg);
   gfx->setClipRect(0, y, SCREEN_W, h);
   for (int x = -h; x < SCREEN_W + h; x += 2 * h) {
-    gfx->fillTriangle(x, y + h, x + h, y, x + 2 * h, y, COL_AMBER);
-    gfx->fillTriangle(x, y + h, x + h, y + h, x + 2 * h, y, COL_AMBER);
+    gfx->fillTriangle(x, y + h, x + h, y, x + 2 * h, y, pal.accent);
+    gfx->fillTriangle(x, y + h, x + h, y + h, x + 2 * h, y, pal.accent);
   }
   gfx->clearClipRect();
 }
 
 // Small grab bar at the top edge: a reminder that swiping down opens the menu.
-static void drawPullHandle(uint32_t col = COL_AMBER_DIM) {
+static void drawPullHandle(uint32_t col = pal.dim) {
   gfx->fillRect(SCREEN_W / 2 - 22, 1, 44, 3, col);
 }
 
 // ---------------------------------------------------------------- full-screen messages
 static void drawMessageScreen(const char* big, const char* line1, const char* line2, const char* hint = nullptr) {
   gfx->startWrite();
-  gfx->fillScreen(COL_BG);
+  gfx->fillScreen(pal.bg);
   drawHazardBand(0, 12);
   drawHazardBand(SCREEN_H - 12, 12);
-  gfx->drawRect(8, 22, SCREEN_W - 16, SCREEN_H - 44, COL_AMBER_DIM);
+  gfx->drawRect(8, 22, SCREEN_W - 16, SCREEN_H - 44, pal.dim);
   gfx->setTextDatum(lgfx::textdatum_t::top_center);
   gfx->setFont(FONT_BIG);
-  gfx->setTextColor(COL_AMBER, COL_BG);
+  gfx->setTextColor(pal.accent, pal.bg);
   gfx->drawString(big, SCREEN_W / 2, 82);
   gfx->setFont(FONT_BODY);
-  gfx->setTextColor(COL_AMBER, COL_BG);
+  gfx->setTextColor(pal.accent, pal.bg);
   if (line1) gfx->drawString(line1, SCREEN_W / 2, 122);
   if (line2) gfx->drawString(line2, SCREEN_W / 2, 142);
   if (hint) {
     gfx->setFont(FONT_SMALL);
-    gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+    gfx->setTextColor(pal.dim, pal.bg);
     gfx->drawString(hint, SCREEN_W / 2, 198);
   }
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
@@ -173,104 +281,6 @@ static const char* const MENU_HINT = "SWIPE DOWN FOR MENU";
 static void drawNoLink()  { drawMessageScreen("NO SIGNAL", "Waiting for the computer.", "Start the companion app.", MENU_HINT); }
 static void drawStandby() { drawMessageScreen("STANDBY", "Nothing is playing.", nullptr, MENU_HINT); }
 
-
-// ---------------------------------------------------------------- music screen colors
-// Every screen uses the THEME colors above. The music screen draws with 'musicPal', which is
-// the same theme unless "album colors" is on; then it is rebuilt from each album cover.
-struct Palette {
-  uint32_t bg, accent, dim, rust, cream;
-  bool operator==(const Palette& o) const { return bg == o.bg && accent == o.accent && dim == o.dim && rust == o.rust && cream == o.cream; }
-};
-static const Palette SYSTEM_PALETTE = { COL_BG, COL_AMBER, COL_AMBER_DIM, COL_RUST, COL_CREAM };
-static Palette musicPal = SYSTEM_PALETTE;
-
-// h in 0..360, s and l in 0..1  ->  0xRRGGBB
-static uint32_t hslColor(float h, float s, float l) {
-  float c = (1 - (l * 2 > 1 ? l * 2 - 1 : 1 - l * 2)) * s;
-  float hp = h / 60.0f;
-  float t = hp - 2 * (int)(hp / 2);
-  float x = c * (1 - (t > 1 ? t - 1 : 1 - t));
-  float r = 0, g = 0, b = 0;
-  switch (((int)hp) % 6) {
-    case 0: r = c; g = x; break;
-    case 1: r = x; g = c; break;
-    case 2: g = c; b = x; break;
-    case 3: g = x; b = c; break;
-    case 4: r = x; b = c; break;
-    default: r = c; b = x; break;
-  }
-  float m = l - c / 2;
-  int R = (int)((r + m) * 255 + 0.5f), G = (int)((g + m) * 255 + 0.5f), B = (int)((b + m) * 255 + 0.5f);
-  return ((uint32_t)R << 16) | ((uint32_t)G << 8) | (uint32_t)B;
-}
-
-static float luma(uint32_t c) {
-  return (0.299f * ((c >> 16) & 255) + 0.587f * ((c >> 8) & 255) + 0.114f * (c & 255)) / 255.0f;
-}
-
-// Same hue, but light enough to read: blues and purples need more lightness than yellows.
-static uint32_t hslReadable(float h, float s, float l, float minLuma) {
-  uint32_t c = hslColor(h, s, l);
-  while (luma(c) < minLuma && l < 0.88f) { l += 0.03f; c = hslColor(h, s, l); }
-  return c;
-}
-
-// Finds the cover's main color and builds a dark background, a bright accent and the in-between
-// tones from it. 'art' is ART_SIZE x ART_SIZE pixels of RGB565, high byte first.
-static Palette paletteFromArt(const uint8_t* art) {
-  static const int BINS = 24;
-  uint32_t weight[BINS] = { 0 }, sumR[BINS] = { 0 }, sumG[BINS] = { 0 }, sumB[BINS] = { 0 };
-  uint32_t samples = 0, colorful = 0;
-  for (int y = 0; y < ART_SIZE; y += 2) {
-    for (int x = 0; x < ART_SIZE; x += 2) {
-      const uint8_t* p = art + ((size_t)y * ART_SIZE + x) * 2;
-      uint16_t v = ((uint16_t)p[0] << 8) | p[1];
-      int r = ((v >> 11) & 31) * 255 / 31, g = ((v >> 5) & 63) * 255 / 63, b = (v & 31) * 255 / 31;
-      int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-      int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
-      int chroma = mx - mn;
-      ++samples;
-      if (chroma < 45 || mx < 55) continue;          // gray, black or white: no hue to speak of
-      float h;
-      if (mx == r)      h = 60.0f * (g - b) / chroma + (g < b ? 360.0f : 0.0f);
-      else if (mx == g) h = 60.0f * (b - r) / chroma + 120.0f;
-      else              h = 60.0f * (r - g) / chroma + 240.0f;
-      int bin = ((int)(h / (360.0f / BINS))) % BINS;
-      weight[bin] += chroma; sumR[bin] += r * chroma; sumG[bin] += g * chroma; sumB[bin] += b * chroma;
-      ++colorful;
-    }
-  }
-
-  float h = 0, s = 0;
-  if (colorful * 100 >= samples * 6) {
-    int best = 0; uint32_t bestScore = 0;
-    for (int i = 0; i < BINS; ++i) {
-      uint32_t score = weight[i] * 2 + weight[(i + 1) % BINS] + weight[(i + BINS - 1) % BINS];
-      if (score > bestScore) { bestScore = score; best = i; }
-    }
-    float r = (float)sumR[best] / weight[best], g = (float)sumG[best] / weight[best], b = (float)sumB[best] / weight[best];
-    float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
-    float mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
-    float c = mx - mn;
-    if (c > 1) {
-      if (mx == r)      h = 60.0f * (g - b) / c + (g < b ? 360.0f : 0.0f);
-      else if (mx == g) h = 60.0f * (b - r) / c + 120.0f;
-      else              h = 60.0f * (r - g) / c + 240.0f;
-      float l = (mx + mn) / 510.0f;
-      float d = 1 - (l * 2 > 1 ? l * 2 - 1 : 1 - l * 2);
-      s = d > 0.01f ? (c / 255.0f) / d : 0;
-      if (s > 1) s = 1;
-    }
-  }
-
-  Palette p;
-  p.bg     = hslColor(h, s * 0.60f, 0.09f);
-  p.rust   = hslColor(h, s * 0.55f, 0.19f);
-  p.dim    = hslReadable(h, s * 0.60f, 0.40f, 0.22f);
-  p.accent = hslReadable(h, s * 0.90f, 0.62f, 0.50f);
-  p.cream  = hslColor(h, s * 0.40f, 0.94f);
-  return p;
-}
 
 // ---------------------------------------------------------------- now-playing pieces
 static void drawArt(const UiState& s) {

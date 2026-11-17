@@ -282,8 +282,11 @@ class Companion:
     def _weather_loop(self):
         """Runs in the background: fetch now, then every 15 minutes. Retry sooner after a failure."""
         if self.args.demo:
-            self.weather_updates.put(("ok", ("Demo City", 0, 0), extras.demo_forecast(), datetime.datetime.now()))
-            return
+            step, started = 0, datetime.datetime.now()
+            while True:                                   # a new made-up sky every few seconds
+                self.weather_updates.put(("ok", ("Demo City", 0, 0), extras.demo_forecast(step), started))
+                step += 1
+                time.sleep(extras.DEMO_SKY_SECONDS)
         has_place = self.settings.get("city") or ("latitude" in self.settings and "longitude" in self.settings)
         if not has_place:
             self.weather_updates.put(("err", "Set your city in settings.json"))

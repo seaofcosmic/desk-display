@@ -106,7 +106,7 @@ def fetch_weather(settings: dict, place=None):
             place = find_place(settings["city"])
     url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode({
         "latitude": place[1], "longitude": place[2],
-        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day",
         "daily": "weather_code,temperature_2m_max,temperature_2m_min",
         "temperature_unit": "celsius", "wind_speed_unit": "kmh",
         "timezone": "auto", "forecast_days": 3,
@@ -137,6 +137,7 @@ def weather_payload(place, forecast: dict, celsius: bool, h24: bool, to_ascii, f
         (f"{int(round(wind))} KM/H" if celsius else f"{int(round(wind * 0.621371))} MPH").encode(),
         f"{int(round(float(cur['relative_humidity_2m'])))}%".encode(),
         fmt_clock(fetched_at.hour, fetched_at.minute, h24).encode(),
+        b"D" if int(cur.get("is_day", 1) or 0) else b"N",       # day or night, for the animated sky
     ]
     for i, day in enumerate(daily["time"][:3]):
         name = "TODAY" if i == 0 else datetime.date.fromisoformat(day).strftime("%a").upper()
@@ -149,12 +150,19 @@ def weather_error(message: str) -> bytes:
     return b"ERR\n" + message.encode("ascii", "replace")[:60] + b"\n"
 
 
-def demo_forecast(today: Optional[datetime.date] = None) -> dict:
+# Made-up weather for --demo. It steps through these so every animated sky can be seen:
+# (Open-Meteo weather code, 1 = day or 0 = night)
+DEMO_SKIES = [(0, 1), (2, 1), (63, 1), (95, 0), (73, 0), (45, 1), (3, 1), (0, 0)]
+DEMO_SKY_SECONDS = 8
+
+
+def demo_forecast(step: int = 0, today: Optional[datetime.date] = None) -> dict:
     today = today or datetime.date.today()
+    code, is_day = DEMO_SKIES[step % len(DEMO_SKIES)]
     days = [(today + datetime.timedelta(days=i)).isoformat() for i in range(3)]
     return {"current": {"temperature_2m": 20.0, "relative_humidity_2m": 61, "apparent_temperature": 19.0,
-                        "weather_code": 2, "wind_speed_10m": 13.0},
-            "daily": {"time": days, "weather_code": [2, 63, 0],
+                        "weather_code": code, "wind_speed_10m": 13.0, "is_day": is_day},
+            "daily": {"time": days, "weather_code": [code, 63, 0],
                       "temperature_2m_max": [22.2, 17.8, 23.9], "temperature_2m_min": [12.8, 11.1, 13.3]}}
 
 

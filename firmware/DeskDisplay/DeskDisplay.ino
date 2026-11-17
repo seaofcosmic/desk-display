@@ -8,14 +8,17 @@
 //   REMINDERS  a checklist from reminders.txt on the computer, with timed alerts
 //   CALENDAR   the next 7 days from a Notion database
 //   SYSTEM     the computer's CPU, memory, disk and temperatures, plus this board's own
-//   SETTINGS   options for each app, saved on the board
+//   SETTINGS   options for each app, saved on the board. "Look" switches the whole display
+//              between Minimal (amber) and Full color (a color per app, an animated sky in
+//              Weather, album colors in Music)
 // Touches are sent back to the computer, which controls the music app and the reminders file.
 //
 // Arduino IDE setup:
 //   Board:   "ESP32 Dev Module"      (install "esp32 by Espressif Systems" in Boards Manager)
 //   Library: "LovyanGFX"             (install from Library Manager)
 //
-// Look and layout live in ui.h (music, shared pieces) and apps.h (menu and the other apps).
+// Look and layout live in ui.h (music, shared pieces), apps.h (menu and the other apps) and
+// scene.h (the animated weather sky).
 // The USB message format lives in protocol.h.
 
 // ---------------------------------------------------------------- SETTINGS
@@ -151,6 +154,7 @@ static uint32_t     clockSyncEpoch = 0, clockSyncAtMs = 0, clockShownEpoch = 0;
 static Weather      weather;
 static ReminderList reminders;
 static int          remPage = 0;
+static bool         weatherDetails = false;   // Full color weather: the details are showing over the sky
 static Alert        alert;
 static EventList    events;
 static int          evtPage = 0;
@@ -191,10 +195,26 @@ static void setLight(bool on) {
   digitalWrite(16, on ? LOW : HIGH);    // green; red + green together make yellow
 }
 
-// Picks the music screen's colors: from the album cover if that setting is on, otherwise the
-// system look. Returns true if the colors changed.
+// The colors an app's screen should use. In the Minimal look that is always the amber theme.
+static Palette paletteFor(App a) {
+  if (!settings.fullColor) return SYSTEM_PALETTE;
+  switch (a) {
+    case APP_MUSIC:   return musicPal;
+    case APP_CLOCK:   return clockState.known ? clockPalette(clockNow(millis())) : appPalette(a);
+    case APP_WEATHER: {
+      if (!weather.valid) return appPalette(a);
+      float hue, sat;
+      sceneHue(weather.icon, weather.night, hue, sat);
+      return paletteFromHS(hue, sat);
+    }
+    default:          return appPalette(a);
+  }
+}
+
+// Picks the music screen's colors: from the album cover in the Full color look (if album
+// colors are on), otherwise the amber theme. Returns true if the colors changed.
 static bool refreshMusicPalette() {
-  Palette p = (settings.albumColors && ui.artValid) ? paletteFromArt(artBuf) : SYSTEM_PALETTE;
+  Palette p = (settings.fullColor && settings.albumColors && ui.artValid) ? paletteFromArt(artBuf) : SYSTEM_PALETTE;
   if (p == musicPal) return false;
   musicPal = p;
   return true;
@@ -229,8 +249,9 @@ static void showCurrent() {
   ui.pressed = ZONE_NONE;
   applyBrightness();
 
-  if (alertOpen) { drawAlert(alert); return; }
-  if (menuOpen)  { drawMenu(app); return; }
+  if (alertOpen) { pal = SYSTEM_PALETTE; drawAlert(alert); return; }
+  if (menuOpen)  { pal = settings.fullColor ? menuPalette() : SYSTEM_PALETTE; drawMenu(app); return; }
+  pal = paletteFor(app);
 
   switch (app) {
     case APP_CLOCK:
@@ -238,7 +259,8 @@ static void showCurrent() {
       drawClockScreen(clockState);
       break;
     case APP_WEATHER:
-      drawWeatherScreen(weather);
+      if (weatherImmersive(weather) && weatherDetails) drawWeatherDetails(weather);
+      else drawWeatherScreen(weather);
       break;
     case APP_REMINDERS:
       if (remPage >= reminderPages(reminders)) remPage = 0;
@@ -424,10 +446,16 @@ static void changeSetting(int i) {
   saveSettings();
   drawSettingsRow(settings, setPage, i);
   switch (i) {
-    case 0: refreshMusicPalette(); break;
-    case 1: clockState.h24 = settings.h24; sendSettings(); break;
-    case 2: case 3: case 4: sendSettings(); break;
-    case 6: applyBrightness(); break;
+    case 0:                                   // the look changed: repaint in the new colors
+      fullColorMode = settings.fullColor;
+      weatherDetails = false;
+      refreshMusicPalette();
+      showCurrent();
+      break;
+    case 1: refreshMusicPalette(); break;
+    case 2: clockState.h24 = settings.h24; sendSettings(); break;
+    case 3: case 4: case 5: sendSettings(); break;
+    case 7: applyBrightness(); break;
   }
 }
 
@@ -436,6 +464,7 @@ static void onTap(int x, int y) {
     int t = menuTileAt(x, y);
     if (t >= 0) {
       app = (App)t;
+      weatherDetails = false;
       menuOpen = false;
       rememberApp();
       showCurrent();
@@ -548,11 +577,17 @@ static void onRelease() {
   int k = trailLen >= 3 ? 1 : trailLen - 1;
   int dx = trailX[k] - startX, dy = trailY[k] - startY;
 
+  // In the full-screen weather sky, swiping up brings up the details and swiping down puts
+  // them away again. Everywhere else, down opens the menu and up closes it.
+  bool sky = !menuOpen && app == APP_WEATHER && weatherImmersive(weather);
+
   if (dy >= SWIPE_MIN && abs(dx) < 120) {
-    if (!menuOpen) { menuOpen = true; showCurrent(); }
+    if (sky && weatherDetails) { weatherDetails = false; showCurrent(); }
+    else if (!menuOpen) { menuOpen = true; showCurrent(); }
     else if (pressedTile >= 0) drawMenuTile(pressedTile, pressedTile == app, false);
   } else if (dy <= -SWIPE_MIN && abs(dx) < 120) {
     if (menuOpen) { menuOpen = false; showCurrent(); }
+    else if (sky && !weatherDetails) { weatherDetails = true; showCurrent(); }
   } else if (abs(dx) <= TAP_MAX && abs(dy) <= TAP_MAX) {
     onTap(startX, startY);
   } else if (menuOpen && pressedTile >= 0) {
@@ -609,6 +644,7 @@ static void setupTouchCalibration() {
   Settings stored;
   if (prefs.getBytes("set", &stored, sizeof stored) == sizeof stored && stored.version == settings.version) settings = stored;
   settings.brightness &= 3;
+  fullColorMode = settings.fullColor;
   clockState.h24 = settings.h24;
   prefs.end();
 }
@@ -638,6 +674,7 @@ void setup() {
   lcd.setRotation(SCREEN_ROTATION);
   lcd.setBrightness(255);
   uiBegin(&lcd);
+  sceneBegin(&lcd);
 
   drawMessageScreen("DESK DISPLAY", "Starting up.", "Hold the screen to redo touch setup.");
   setupTouchCalibration();
@@ -687,11 +724,21 @@ void loop() {
     }
   }
 
+  // The animated sky in the Weather app (Full color look only).
+  if (appVisible(APP_WEATHER) && weatherImmersive(weather) && !weatherDetails) {
+    static uint32_t lastSceneMs = 0;
+    if (now - lastSceneMs >= SCENE_FRAME_MS) {
+      lastSceneMs = now;
+      drawWeatherSky(weather, true);
+    }
+  }
+
   if (appVisible(APP_CLOCK) && clockState.known) {
     uint32_t e = clockNow(now);
     if (e != clockShownEpoch) {
       clockState.epoch = e;
       if (e / 60 != clockShownEpoch / 60) {
+        if (!(paletteFor(APP_CLOCK) == pal)) { showCurrent(); return; }   // the time of day moved on: new colors
         drawClockTime(clockState);
         if (e / 86400 != clockShownEpoch / 86400) drawClockDate(clockState);
       }
