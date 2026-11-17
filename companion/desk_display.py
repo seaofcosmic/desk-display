@@ -9,16 +9,18 @@ and control the music app.
              Spotify, a browser tab, ...).
     Mac:     follows the Music app (Apple Music).
 
-It also keeps the display's clock set, sends the weather for the city in
-settings.json, and sends the list in reminders.txt.
+It also keeps the display's clock set and sends it the weather for the city in
+settings.json, the list in reminders.txt, upcoming items from a Notion database,
+and this computer's CPU, memory, disk and temperature readings.
 
 Run:   python desk_display.py            find the display and start
-       python desk_display.py --demo     show fake tracks and weather, to test the display
+       python desk_display.py --demo     show fake tracks, weather and calendar, to test the display
        python desk_display.py --port COM5
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import io
 import json
@@ -34,6 +36,8 @@ import urllib.request
 from typing import Optional
 
 import extras
+import notion_calendar
+import pc_stats
 from nowplaying import NowPlaying
 
 ART_SIZE = 140
@@ -146,17 +150,20 @@ class DemoMedia:
         t = self.TRACKS[self.i]
         return NowPlaying(t[0], t[1], t[2], self.playing, int(self.pos * 1000), t[3] * 1000, True)
 
+    COVERS = [((226, 120, 30), (40, 28, 20)), ((24, 44, 130), (120, 170, 245)), ((36, 12, 44), (214, 44, 150))]
+
     def get_art(self, np):
-        # Red top-left, green top-right, blue bottom-left, white bottom-right:
-        # if the display shows other colors, the screen-chip setting is wrong.
+        # Each fake cover has one main color, so the "album colors" setting has something to show.
+        # The four small squares are red, green, blue, white, left to right: if the display shows
+        # them in other colors, the screen-chip setting is wrong.
         from PIL import Image, ImageDraw
-        img = Image.new("RGB", (280, 280))
+        back, front = self.COVERS[self.i % len(self.COVERS)]
+        img = Image.new("RGB", (280, 280), back)
         d = ImageDraw.Draw(img)
-        for (x, y), c in zip([(0, 0), (140, 0), (0, 140), (140, 140)],
-                             [(220, 30, 30), (30, 190, 60), (40, 70, 220), (240, 240, 240)]):
-            d.rectangle([x, y, x + 139, y + 139], fill=c)
-        d.ellipse([90, 90, 190, 190], fill=(239, 159, 39))
-        d.text((132, 132), str(self.i + 1), fill=(0, 0, 0))
+        d.ellipse([50, 60, 230, 240], fill=front)
+        d.ellipse([112, 122, 168, 178], fill=back)
+        for k, c in enumerate([(220, 30, 30), (30, 190, 60), (40, 70, 220), (240, 240, 240)]):
+            d.rectangle([12 + k * 26, 12, 34 + k * 26, 34], fill=c)
         buf = io.BytesIO()
         img.save(buf, "PNG")
         return buf.getvalue()
@@ -258,39 +265,124 @@ class Companion:
         self.online_results: "queue.Queue" = queue.Queue()
 
         self.settings = extras.load_settings(args.data_dir, self.log)
-        self.h24 = bool(self.settings.get("clock_24_hour"))
-        self.reminders = extras.Reminders(os.path.join(args.data_dir, "reminders.txt"), self.h24, to_ascii)
-        self.weather_frame = frame(b"W", extras.weather_error("Getting the weather."))
+        # What the display's Settings app is set to. The display reports these when it connects.
+        self.device = {"H24": 0, "WC": 0, "RA": 1, "CA": 1}
+        self.reminders = extras.Reminders(os.path.join(args.data_dir, "reminders.txt"), False, to_ascii)
+        self.stats = pc_stats.PcStats()
+        self.fired_events = set()
+
+        self.weather = ("err", "Getting the weather.")      # or ("ok", place, forecast, fetched at)
         self.weather_updates: "queue.Queue" = queue.Queue()
         threading.Thread(target=self._weather_loop, daemon=True).start()
+
+        self.calendar = ("err", "Getting your calendar.")   # or ("ok", events)
+        self.calendar_updates: "queue.Queue" = queue.Queue()
+        threading.Thread(target=self._calendar_loop, daemon=True).start()
 
     def _weather_loop(self):
         """Runs in the background: fetch now, then every 15 minutes. Retry sooner after a failure."""
         if self.args.demo:
-            self.weather_updates.put(frame(b"W", extras.DEMO_WEATHER))
+            self.weather_updates.put(("ok", ("Demo City", 0, 0), extras.demo_forecast(), datetime.datetime.now()))
             return
         has_place = self.settings.get("city") or ("latitude" in self.settings and "longitude" in self.settings)
         if not has_place:
-            self.weather_updates.put(frame(b"W", extras.weather_error("Set your city in settings.json")))
+            self.weather_updates.put(("err", "Set your city in settings.json"))
             return
         place, have_data = None, False
         while True:
             try:
                 place, forecast = extras.fetch_weather(self.settings, place)
-                self.weather_updates.put(frame(b"W", extras.weather_payload(place, forecast, self.settings, to_ascii)))
+                self.weather_updates.put(("ok", place, forecast, datetime.datetime.now()))
                 have_data = True
                 wait = 15 * 60
             except LookupError as e:
                 self.log(f"Weather: {e}. Check the city in settings.json.")
-                self.weather_updates.put(frame(b"W", extras.weather_error("City not found. Check settings.json")))
+                self.weather_updates.put(("err", "City not found. Check settings.json"))
                 return
             except Exception as e:
                 if self.args.verbose:
                     self.log("weather error:", repr(e))
                 if not have_data:
-                    self.weather_updates.put(frame(b"W", extras.weather_error("Could not get the weather.")))
+                    self.weather_updates.put(("err", "Could not get the weather."))
                 wait = 60
             time.sleep(wait)
+
+    def _calendar_loop(self):
+        """Runs in the background: read the Notion database now, then every 5 minutes."""
+        if self.args.demo:
+            self.calendar_updates.put(("ok", notion_calendar.demo_events()))
+            return
+        token = str(self.settings.get("notion_token") or "").strip()
+        database = str(self.settings.get("notion_database_id") or "").strip()
+        if not token:
+            self.calendar_updates.put(("err", "Add your Notion token to settings.json"))
+            return
+        if not database:
+            self.calendar_updates.put(("err", "Add notion_database_id to settings.json"))
+            return
+        source_id, columns, have_data = None, None, False
+        while True:
+            try:
+                if source_id is None:
+                    source = notion_calendar.find_data_source(token, database)
+                    columns = notion_calendar.pick_columns(source, str(self.settings.get("notion_date_property") or ""))
+                    source_id = source["id"]
+                    self.log(f"Calendar: reading Notion dates from the '{columns[1]}' column.")
+                self.calendar_updates.put(("ok", notion_calendar.read_events(token, source_id, columns)))
+                have_data = True
+                wait = 5 * 60
+            except Exception as e:
+                message = notion_calendar.explain(e)
+                self.log(f"Calendar: {message}.")
+                if self.args.verbose:
+                    self.log("calendar error:", repr(e))
+                if not have_data:
+                    self.calendar_updates.put(("err", message))
+                wait = 120
+            time.sleep(wait)
+
+    def _weather_frame(self) -> bytes:
+        if self.weather[0] != "ok":
+            return frame(b"W", extras.weather_error(self.weather[1]))
+        _, place, forecast, fetched_at = self.weather
+        try:
+            return frame(b"W", extras.weather_payload(place, forecast, bool(self.device["WC"]), bool(self.device["H24"]), to_ascii, fetched_at))
+        except Exception as e:
+            if self.args.verbose:
+                self.log("weather format error:", repr(e))
+            return frame(b"W", extras.weather_error("Could not read the weather."))
+
+    def _calendar_frame(self) -> bytes:
+        if self.calendar[0] != "ok":
+            return frame(b"E", notion_calendar.error_payload(self.calendar[1]))
+        return frame(b"E", notion_calendar.events_payload(self.calendar[1], bool(self.device["H24"]), extras.fmt_clock, to_ascii))
+
+    def _event_alerts(self):
+        """Timed events that start within the next ten minutes and have not been announced."""
+        if self.calendar[0] != "ok":
+            return []
+        now = datetime.datetime.now()
+        out = []
+        for e in self.calendar[1]:
+            start = e["start"]
+            if start is None:
+                continue
+            key = (start, e["title"])
+            if datetime.timedelta(0) <= start - now <= datetime.timedelta(minutes=10) and key not in self.fired_events:
+                self.fired_events.add(key)
+                out.append(extras.fmt_clock(start.hour, start.minute, bool(self.device["H24"])).encode() + b"\n" + to_ascii(e["title"], 64) + b"\n")
+        return out
+
+    def _device_settings(self, text: str) -> bool:
+        """'H24=0,WC=1,...' from the display. Returns True if anything changed."""
+        changed = False
+        for part in text.split(","):
+            key, _, value = part.partition("=")
+            if key in self.device and value.strip().lstrip("-").isdigit() and self.device[key] != int(value):
+                self.device[key] = int(value)
+                changed = True
+        self.reminders.h24 = bool(self.device["H24"])
+        return changed
 
     def log(self, *a):
         print(time.strftime("%H:%M:%S"), *a, flush=True)
@@ -337,7 +429,10 @@ class Companion:
         last_clock_at = 0.0          # when the time, reminders and alerts were last sent or checked
         last_reminder_check = 0.0
         last_alert_check = 0.0
+        last_stats_at = 0.0
+        last_calendar_at = 0.0
         weather_sent = None
+        calendar_sent = None
 
         while True:
             now = time.monotonic()
@@ -356,8 +451,12 @@ class Companion:
                     ready = True
                     sent_key, last_state, art_hash, art_frame = None, None, None, None
                     next_poll = 0.0
-                    last_clock_at, weather_sent = 0.0, None
+                    last_clock_at, weather_sent, calendar_sent = 0.0, None, None
                     self.reminders.stamp = None            # send the list again
+                elif line.startswith("DT:SET:"):
+                    if self._device_settings(line[7:]):
+                        self.reminders.stamp = None        # times may need reformatting
+                        last_calendar_at = 0.0
                 elif line.startswith("DT:ERR:NODISPLAY"):
                     self.log("The board cannot find its screen. Set DISPLAY_DRIVER to 1 or 2 in the firmware and upload again.")
                 elif line == "DT:NAK:A" and art_frame:
@@ -383,19 +482,33 @@ class Companion:
                 time.sleep(0.05)
                 continue
 
-            # ---- clock, weather, reminders
+            # ---- clock, weather, calendar, reminders, computer stats
             if now - last_clock_at >= 30.0:
-                link.send(frame(b"T", extras.time_payload(self.h24)))
+                link.send(frame(b"T", extras.time_payload()))
                 last_clock_at = now
 
             try:
                 while True:
-                    self.weather_frame = self.weather_updates.get_nowait()
+                    self.weather = self.weather_updates.get_nowait()
             except queue.Empty:
                 pass
-            if weather_sent is not self.weather_frame:
-                link.send(self.weather_frame)
-                weather_sent = self.weather_frame
+            weather_frame = self._weather_frame()
+            if weather_frame != weather_sent:
+                link.send(weather_frame)
+                weather_sent = weather_frame
+
+            try:
+                while True:
+                    self.calendar = self.calendar_updates.get_nowait()
+                    last_calendar_at = 0.0
+            except queue.Empty:
+                pass
+            if now - last_calendar_at >= 30.0:              # also keeps "TODAY" and passed events current
+                last_calendar_at = now
+                calendar_frame = self._calendar_frame()
+                if calendar_frame != calendar_sent:
+                    link.send(calendar_frame)
+                    calendar_sent = calendar_frame
 
             if now - last_reminder_check >= 1.0:
                 last_reminder_check = now
@@ -404,9 +517,17 @@ class Companion:
                     link.send(frame(b"R", self.reminders.payload()))
             if now - last_alert_check >= 5.0:
                 last_alert_check = now
-                for alert in self.reminders.due_alerts():
+                alerts = (self.reminders.due_alerts() if self.device["RA"] else []) + \
+                         (self._event_alerts() if self.device["CA"] else [])
+                for alert in alerts:
                     link.send(frame(b"N", alert))
-                    self.log("Reminder:", alert.decode().replace("\n", " ").strip())
+                    self.log("Alert:", alert.decode().replace("\n", " ").strip())
+
+            if now - last_stats_at >= 2.0:
+                last_stats_at = now
+                stats = self.stats.payload()
+                if stats:
+                    link.send(frame(b"Y", stats))
 
             # ---- what is playing
             if now >= next_poll:

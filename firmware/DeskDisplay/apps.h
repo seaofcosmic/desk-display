@@ -1,11 +1,11 @@
-// apps.h - the menu and the Clock, Weather and Reminders screens.
+// apps.h - the menu and the Clock, Weather, Reminders, Calendar, System and Settings screens.
 // Uses the colors, fonts and helpers from ui.h.
 #pragma once
 #include "ui.h"
 #include <time.h>
 #include <stdlib.h>
 
-enum App { APP_MUSIC = 0, APP_CLOCK = 1, APP_WEATHER = 2, APP_REMINDERS = 3, APP_COUNT = 4 };
+enum App { APP_MUSIC = 0, APP_CLOCK, APP_WEATHER, APP_REMINDERS, APP_CALENDAR, APP_SYSTEM, APP_SETTINGS, APP_COUNT };
 
 // ---------------------------------------------------------------- data the computer sends
 struct ClockState {
@@ -34,6 +34,39 @@ struct ReminderList {
 };
 
 struct Alert { char time[10] = ""; char text[66] = ""; };
+
+static const int EVT_MAX = 10, LIST_ROWS = 5;
+struct CalEvent { char day[10] = ""; char time[10] = ""; char title[66] = ""; };
+struct EventList {
+  bool valid = false;        // false: show 'error' instead
+  char error[64] = "Waiting for the computer.";
+  int count = 0;
+  CalEvent items[EVT_MAX];
+};
+
+static const int STAT_UNKNOWN = -1000;
+struct Stats {
+  bool pcValid = false;      // the computer has sent numbers
+  int cpu = 0, mem = 0, disk = 0;                         // percent
+  int cpuTemp = STAT_UNKNOWN, gpuTemp = STAT_UNKNOWN;     // degrees C
+  int chipTemp = STAT_UNKNOWN;                            // this board, degrees C
+  uint32_t uptimeSec = 0;
+  uint32_t freeKb = 0;
+  bool linkUp = false;
+};
+
+// Everything the Settings app can change. Saved on the board.
+struct Settings {
+  uint8_t version     = 1;
+  bool albumColors    = true;    // MUSIC: color the music screen from the album cover
+  bool h24            = false;   // CLOCK: 24-hour time (also used for times in other apps)
+  bool weatherC       = false;   // WEATHER: Celsius instead of Fahrenheit
+  bool reminderAlerts = true;    // REMINDERS: full-screen alert for timed reminders
+  bool eventAlerts    = true;    // CALENDAR: alert 10 minutes before an event
+  bool statsF         = false;   // SYSTEM: Fahrenheit instead of Celsius
+  uint8_t brightness  = 3;       // DISPLAY: 0..3 = 25, 50, 75, 100 %
+  bool alertLight     = true;    // DISPLAY: blink the light on the back during an alert
+};
 
 // ---------------------------------------------------------------- reading the text messages
 static void takeField(char* dst, size_t n, const char*& p) {      // up to the next '|'
@@ -94,6 +127,37 @@ static void parseReminders(const char* p, ReminderList& r) {
     if (it.text[0]) ++r.count;
   }
   r.valid = true;
+}
+
+// "OK" then one line per event: "day|time|title".   Or: "ERR" and a message line.
+static void parseEvents(const char* p, EventList& e) {
+  char tmp[16];
+  takeLine(tmp, sizeof tmp, p);
+  e.count = 0;
+  if (strcmp(tmp, "OK") != 0) {
+    e.valid = false;
+    takeLine(e.error, sizeof e.error, p);
+    return;
+  }
+  e.valid = true;
+  while (*p && e.count < EVT_MAX) {
+    CalEvent& it = e.items[e.count];
+    takeField(it.day, sizeof it.day, p);
+    takeField(it.time, sizeof it.time, p);
+    takeLine(it.title, sizeof it.title, p);
+    if (it.title[0]) ++e.count;
+  }
+}
+
+// Five lines: cpu %, memory %, disk %, cpu temperature, graphics temperature (C, or "-").
+static void parseStats(const char* p, Stats& s) {
+  char tmp[16];
+  takeLine(tmp, sizeof tmp, p); s.cpu = atoi(tmp);
+  takeLine(tmp, sizeof tmp, p); s.mem = atoi(tmp);
+  takeLine(tmp, sizeof tmp, p); s.disk = atoi(tmp);
+  takeLine(tmp, sizeof tmp, p); s.cpuTemp = (tmp[0] && tmp[0] != '-') ? atoi(tmp) : STAT_UNKNOWN;
+  takeLine(tmp, sizeof tmp, p); s.gpuTemp = (tmp[0] && tmp[0] != '-') ? atoi(tmp) : STAT_UNKNOWN;
+  s.pcValid = true;
 }
 
 static void parseAlert(const char* p, Alert& a) {
@@ -178,18 +242,76 @@ static void drawWeatherIcon(int icon, int cx, int cy, int size, uint32_t colSun,
 }
 
 // ---------------------------------------------------------------- MENU
-static const int TILE_W = 148, TILE_H = 92;
-static const int TILE_X[2] = { 8, 164 };
-static const int TILE_Y[2] = { 34, 136 };
-static const char* const APP_NAMES[APP_COUNT] = { "MUSIC", "CLOCK", "WEATHER", "REMINDERS" };
+static const int TILE_W = 98, TILE_H = 62;
+static const int TILE_X[3] = { 8, 111, 214 };
+static const int TILE_Y[3] = { 30, 98, 166 };
+static const char* const APP_NAMES[APP_COUNT] = { "MUSIC", "CLOCK", "WEATHER", "REMINDERS", "CALENDAR", "SYSTEM", "SETTINGS" };
 
 static int menuTileAt(int x, int y) {
-  if (y < TILE_Y[0] - 4) return -1;
-  return (y < TILE_Y[1] - 5 ? 0 : 2) + (x < SCREEN_W / 2 ? 0 : 1);
+  if (y < TILE_Y[0] - 3) return -1;
+  int col = x < TILE_X[1] - 3 ? 0 : (x < TILE_X[2] - 3 ? 1 : 2);
+  int row = y < TILE_Y[1] - 3 ? 0 : (y < TILE_Y[2] - 3 ? 1 : 2);
+  int i = row * 3 + col;
+  return i < APP_COUNT ? i : -1;
+}
+
+static void drawAppIcon(int i, int cx, int cy, uint32_t ink, uint32_t face) {
+  switch (i) {
+    case APP_MUSIC:
+      gfx->fillCircle(cx - 8, cy + 8, 5, ink);
+      gfx->fillCircle(cx + 8, cy + 5, 5, ink);
+      gfx->fillRect(cx - 5, cy - 10, 2, 19, ink);
+      gfx->fillRect(cx + 11, cy - 13, 2, 19, ink);
+      gfx->fillTriangle(cx - 5, cy - 10, cx + 13, cy - 13, cx + 13, cy - 8, ink);
+      gfx->fillTriangle(cx - 5, cy - 10, cx - 5, cy - 5, cx + 13, cy - 8, ink);
+      break;
+    case APP_CLOCK:
+      gfx->fillCircle(cx, cy, 13, ink);
+      gfx->fillCircle(cx, cy, 10, face);
+      gfx->fillRect(cx - 1, cy - 8, 2, 9, ink);
+      gfx->fillRect(cx - 1, cy - 1, 7, 2, ink);
+      break;
+    case APP_WEATHER:
+      drawWeatherIcon(1, cx, cy, 30, ink, ink, face);
+      break;
+    case APP_REMINDERS:
+      for (int row = 0; row < 2; ++row) {
+        int ry = cy - 11 + row * 13;
+        gfx->drawRect(cx - 17, ry, 9, 9, ink);
+        gfx->fillRect(cx - 4, ry + 3, 21, 3, ink);
+      }
+      gfx->drawLine(cx - 15, cy - 7, cx - 13, cy - 5, ink);
+      gfx->drawLine(cx - 13, cy - 5, cx - 10, cy - 9, ink);
+      break;
+    case APP_CALENDAR:
+      gfx->fillRect(cx - 13, cy - 10, 26, 22, ink);
+      gfx->fillRect(cx - 11, cy - 3, 22, 13, face);
+      gfx->fillRect(cx - 8, cy - 13, 3, 5, ink);
+      gfx->fillRect(cx + 5, cy - 13, 3, 5, ink);
+      for (int r = 0; r < 2; ++r)
+        for (int c = 0; c < 3; ++c) gfx->fillRect(cx - 8 + c * 7, cy + r * 5, 3, 3, ink);
+      break;
+    case APP_SYSTEM:
+      gfx->fillRect(cx - 9, cy - 9, 18, 18, ink);
+      gfx->fillRect(cx - 5, cy - 5, 10, 10, face);
+      for (int k = -1; k <= 1; ++k) {
+        gfx->fillRect(cx + k * 6 - 1, cy - 13, 2, 4, ink);
+        gfx->fillRect(cx + k * 6 - 1, cy + 9, 2, 4, ink);
+        gfx->fillRect(cx - 13, cy + k * 6 - 1, 4, 2, ink);
+        gfx->fillRect(cx + 9, cy + k * 6 - 1, 4, 2, ink);
+      }
+      break;
+    default:
+      for (int k = 0; k < 3; ++k) {
+        int ly = cy - 9 + k * 9;
+        gfx->fillRect(cx - 14, ly, 28, 2, ink);
+        gfx->fillRect(cx - 9 + ((k * 11) % 17), ly - 3, 5, 8, ink);
+      }
+  }
 }
 
 static void drawMenuTile(int i, bool selected, bool pressed) {
-  int x = TILE_X[i % 2], y = TILE_Y[i / 2];
+  int x = TILE_X[i % 3], y = TILE_Y[i / 3];
   uint32_t face = pressed ? COL_CREAM : (selected ? COL_AMBER : COL_BG);
   uint32_t ink  = (pressed || selected) ? COL_BG : COL_AMBER;
   gfx->startWrite();
@@ -198,35 +320,11 @@ static void drawMenuTile(int i, bool selected, bool pressed) {
     gfx->drawRect(x, y, TILE_W, TILE_H, COL_AMBER);
     gfx->drawRect(x + 1, y + 1, TILE_W - 2, TILE_H - 2, COL_AMBER);
   }
-  int cx = x + TILE_W / 2, cy = y + 34;
-  if (i == APP_MUSIC) {
-    gfx->fillCircle(cx - 11, cy + 12, 7, ink);
-    gfx->fillCircle(cx + 11, cy + 8, 7, ink);
-    gfx->fillRect(cx - 7, cy - 14, 3, 27, ink);
-    gfx->fillRect(cx + 15, cy - 18, 3, 27, ink);
-    gfx->fillTriangle(cx - 7, cy - 14, cx + 18, cy - 18, cx + 18, cy - 11, ink);
-    gfx->fillTriangle(cx - 7, cy - 14, cx - 7, cy - 7, cx + 18, cy - 11, ink);
-  } else if (i == APP_CLOCK) {
-    gfx->fillCircle(cx, cy, 19, ink);
-    gfx->fillCircle(cx, cy, 15, face);
-    gfx->fillRect(cx - 1, cy - 11, 3, 13, ink);
-    gfx->fillRect(cx - 1, cy - 1, 10, 3, ink);
-  } else if (i == APP_WEATHER) {
-    drawWeatherIcon(1, cx, cy, 44, ink, ink, face);
-  } else {
-    for (int row = 0; row < 2; ++row) {
-      int ry = cy - 15 + row * 20;
-      gfx->drawRect(cx - 24, ry, 12, 12, ink);
-      gfx->drawRect(cx - 23, ry + 1, 10, 10, ink);
-      gfx->fillRect(cx - 6, ry + 4, 30, 4, ink);
-    }
-    thickLine(cx - 21, cy - 10, cx - 19, cy - 7, ink);
-    thickLine(cx - 19, cy - 7, cx - 15, cy - 13, ink);
-  }
-  gfx->setFont(FONT_TITLE);
+  drawAppIcon(i, x + TILE_W / 2, y + 22, ink, face);
+  gfx->setFont(FONT_BODY);
   gfx->setTextDatum(lgfx::textdatum_t::top_center);
   gfx->setTextColor(ink, face);
-  gfx->drawString(APP_NAMES[i], cx, y + 64);
+  gfx->drawString(APP_NAMES[i], x + TILE_W / 2, y + 41);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->endWrite();
 }
@@ -466,6 +564,222 @@ static void drawRemindersScreen(const ReminderList& r, int page) {
     gfx->drawString(buf, SCREEN_W - 10, REM_FOOT_Y + 12);
     gfx->setTextDatum(lgfx::textdatum_t::top_left);
   }
+}
+
+// ---------------------------------------------------------------- CALENDAR
+static int eventPages(const EventList& e) { return e.count <= LIST_ROWS ? 1 : (e.count + LIST_ROWS - 1) / LIST_ROWS; }
+
+static void drawListFooter(const char* left, int page, int pages) {
+  char buf[40];
+  gfx->setFont(FONT_SMALL);
+  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->drawString(left, 12, REM_FOOT_Y + 12);
+  if (pages > 1) {
+    snprintf(buf, sizeof buf, "PAGE %d/%d  TAP HERE FOR MORE", page + 1, pages);
+    gfx->setTextDatum(lgfx::textdatum_t::top_right);
+    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->drawString(buf, SCREEN_W - 10, REM_FOOT_Y + 12);
+    gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  }
+}
+
+static void drawCalendarScreen(const EventList& e, int page) {
+  if (!e.valid) {
+    drawMessageScreen("CALENDAR", e.error, nullptr, MENU_HINT);
+    return;
+  }
+  gfx->fillScreen(COL_BG);
+  drawHeader("CALENDAR", "FROM NOTION");
+  if (e.count == 0) {
+    gfx->setTextDatum(lgfx::textdatum_t::top_center);
+    gfx->setFont(FONT_BIG);
+    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->drawString("ALL CLEAR", SCREEN_W / 2, 90);
+    gfx->setFont(FONT_BODY);
+    gfx->drawString("Nothing in the next 7 days.", SCREEN_W / 2, 128);
+    gfx->setTextDatum(lgfx::textdatum_t::top_left);
+    return;
+  }
+  gfx->startWrite();
+  for (int row = 0; row < LIST_ROWS; ++row) {
+    int i = page * LIST_ROWS + row;
+    if (i >= e.count) break;
+    const CalEvent& it = e.items[i];
+    int y = REM_ROW_Y + row * REM_ROW_H;
+    gfx->setTextDatum(lgfx::textdatum_t::top_left);
+    gfx->setFont(FONT_SMALL);
+    gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+    gfx->drawString(it.day, 12, y + 5);
+    gfx->setFont(FONT_BODY);
+    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->drawString(it.time, 12, y + 15);
+    gfx->setTextColor(COL_CREAM, COL_BG);
+    drawWrapped(it.title, 92, y + 10, SCREEN_W - 92 - 10, 1, BODY_LINE_H);
+    gfx->drawFastHLine(8, y + REM_ROW_H - 1, SCREEN_W - 16, COL_RUST);
+  }
+  gfx->endWrite();
+  drawListFooter("NEXT 7 DAYS", page, eventPages(e));
+}
+
+// ---------------------------------------------------------------- SYSTEM
+static const int SYS_ROW_Y = 32, SYS_ROW_H = 28, SYS_GAUGE_X = 84, SYS_GAUGE_SEGS = 22;
+
+static void fmtTemp(char* out, size_t n, int celsius, bool fahrenheit) {
+  if (celsius == STAT_UNKNOWN) { snprintf(out, n, "N/A"); return; }
+  if (fahrenheit) snprintf(out, n, "%d F", (celsius * 9 + (celsius >= 0 ? 2 : -2)) / 5 + 32);
+  else            snprintf(out, n, "%d C", celsius);
+}
+
+static void drawSystemGauge(int row, const char* label, int percent, bool known) {
+  int y = SYS_ROW_Y + row * SYS_ROW_H;
+  char buf[12];
+  if (percent < 0) percent = 0;
+  if (percent > 100) percent = 100;
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->setFont(FONT_SMALL);
+  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->drawString(label, 12, y + 8);
+  int lit = known ? (percent * SYS_GAUGE_SEGS + 50) / 100 : 0;
+  for (int i = 0; i < SYS_GAUGE_SEGS; ++i) {
+    bool hot = i >= SYS_GAUGE_SEGS * 85 / 100;            // the last stretch of the gauge is the red line
+    gfx->fillRect(SYS_GAUGE_X + i * 8, y + 5, 6, 14, i < lit ? (hot ? COL_CREAM : COL_AMBER) : COL_RUST);
+  }
+  gfx->fillRect(SYS_GAUGE_X + SYS_GAUGE_SEGS * 8 + 2, y, SCREEN_W - (SYS_GAUGE_X + SYS_GAUGE_SEGS * 8 + 2), SYS_ROW_H - 2, COL_BG);
+  if (known) snprintf(buf, sizeof buf, "%d%%", percent); else snprintf(buf, sizeof buf, "--");
+  gfx->setFont(FONT_TITLE);
+  gfx->setTextDatum(lgfx::textdatum_t::top_right);
+  gfx->setTextColor(COL_AMBER, COL_BG);
+  gfx->drawString(buf, SCREEN_W - 10, y + 5);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+}
+
+static void drawSystemCell(int x, int y, const char* label, const char* value) {
+  gfx->fillRect(x, y + 11, 100, 20, COL_BG);
+  drawStatCell(x, y, label, value, COL_AMBER);
+}
+
+// The numbers only. Called again whenever they change, so nothing flickers.
+static void drawSystemValues(const Stats& st, const Settings& set) {
+  char buf[20];
+  gfx->startWrite();
+  drawSystemGauge(0, "CPU", st.cpu, st.pcValid);
+  drawSystemGauge(1, "MEMORY", st.mem, st.pcValid);
+  drawSystemGauge(2, "DISK", st.disk, st.pcValid);
+
+  fmtTemp(buf, sizeof buf, st.pcValid ? st.cpuTemp : STAT_UNKNOWN, set.statsF);
+  drawSystemCell(12, 124, "CPU TEMP", buf);
+  fmtTemp(buf, sizeof buf, st.pcValid ? st.gpuTemp : STAT_UNKNOWN, set.statsF);
+  drawSystemCell(116, 124, "GRAPHICS TEMP", buf);
+  drawSystemCell(220, 124, "COMPUTER", st.linkUp ? "ONLINE" : "OFFLINE");
+
+  fmtTemp(buf, sizeof buf, st.chipTemp, set.statsF);
+  drawSystemCell(12, 186, "CHIP TEMP", buf);
+  snprintf(buf, sizeof buf, "%u:%02u:%02u", (unsigned)(st.uptimeSec / 3600), (unsigned)((st.uptimeSec / 60) % 60), (unsigned)(st.uptimeSec % 60));
+  drawSystemCell(116, 186, "RUNNING FOR", buf);
+  snprintf(buf, sizeof buf, "%u KB", (unsigned)st.freeKb);
+  drawSystemCell(220, 186, "FREE MEMORY", buf);
+  gfx->endWrite();
+}
+
+static void drawSystemScreen(const Stats& st, const Settings& set) {
+  gfx->fillScreen(COL_BG);
+  drawHeader("SYSTEM", "COMPUTER");
+  gfx->drawFastHLine(8, 118, SCREEN_W - 16, COL_AMBER_DIM);
+  gfx->drawFastHLine(8, 162, SCREEN_W - 16, COL_AMBER_DIM);
+  gfx->setFont(FONT_SMALL);
+  gfx->setTextDatum(lgfx::textdatum_t::top_right);
+  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->drawString("THIS DISPLAY", SCREEN_W - 8, 168);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  drawSystemValues(st, set);
+}
+
+// ---------------------------------------------------------------- SETTINGS
+static const int SETTING_COUNT = 8;
+static const char* const SETTING_APP[SETTING_COUNT]  = { "MUSIC", "CLOCK", "WEATHER", "REMINDERS", "CALENDAR", "SYSTEM", "DISPLAY", "DISPLAY" };
+static const char* const SETTING_NAME[SETTING_COUNT] = {
+  "Album colors", "Time format", "Temperature", "Timed alerts", "Alert before events", "Temperature", "Brightness", "Alert light on the back",
+};
+
+static int settingsPages() { return (SETTING_COUNT + LIST_ROWS - 1) / LIST_ROWS; }
+
+// The text in the box at the right of a row. 'on' says whether to draw it as a lit switch.
+static void settingValue(const Settings& s, int i, char* out, size_t n, bool& isSwitch, bool& on) {
+  isSwitch = true; on = false;
+  switch (i) {
+    case 0: on = s.albumColors; break;
+    case 1: isSwitch = false; snprintf(out, n, s.h24 ? "24 H" : "12 H"); return;
+    case 2: isSwitch = false; snprintf(out, n, s.weatherC ? "C" : "F"); return;
+    case 3: on = s.reminderAlerts; break;
+    case 4: on = s.eventAlerts; break;
+    case 5: isSwitch = false; snprintf(out, n, s.statsF ? "F" : "C"); return;
+    case 6: isSwitch = false; snprintf(out, n, "%d%%", (s.brightness + 1) * 25); return;
+    case 7: on = s.alertLight; break;
+  }
+  snprintf(out, n, on ? "ON" : "OFF");
+}
+
+// Tapping a row moves it to its next value.
+static void settingAdvance(Settings& s, int i) {
+  switch (i) {
+    case 0: s.albumColors = !s.albumColors; break;
+    case 1: s.h24 = !s.h24; break;
+    case 2: s.weatherC = !s.weatherC; break;
+    case 3: s.reminderAlerts = !s.reminderAlerts; break;
+    case 4: s.eventAlerts = !s.eventAlerts; break;
+    case 5: s.statsF = !s.statsF; break;
+    case 6: s.brightness = (s.brightness + 1) % 4; break;
+    case 7: s.alertLight = !s.alertLight; break;
+  }
+}
+
+static int settingAt(int page, int y) {            // -1 = none, -2 = the footer (next page)
+  if (y >= REM_FOOT_Y) return -2;
+  if (y < REM_ROW_Y) return -1;
+  int i = page * LIST_ROWS + (y - REM_ROW_Y) / REM_ROW_H;
+  return i < SETTING_COUNT ? i : -1;
+}
+
+static void drawSettingsRow(const Settings& s, int page, int i) {
+  int row = i - page * LIST_ROWS;
+  if (row < 0 || row >= LIST_ROWS || i >= SETTING_COUNT) return;
+  int y = REM_ROW_Y + row * REM_ROW_H;
+  char val[10]; bool isSwitch, on;
+  settingValue(s, i, val, sizeof val, isSwitch, on);
+
+  gfx->startWrite();
+  gfx->fillRect(0, y, SCREEN_W, REM_ROW_H, COL_BG);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->setFont(FONT_SMALL);
+  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->drawString(SETTING_APP[i], 12, y + 5);
+  gfx->setFont(FONT_BODY);
+  gfx->setTextColor(COL_CREAM, COL_BG);
+  gfx->drawString(SETTING_NAME[i], 12, y + 15);
+
+  int bw = 62, bh = 24, bx = SCREEN_W - 10 - bw, by = y + 6;
+  uint32_t face = (isSwitch && on) ? COL_AMBER : COL_BG;
+  uint32_t ink  = (isSwitch && on) ? COL_BG : ((isSwitch && !on) ? COL_AMBER_DIM : COL_AMBER);
+  gfx->fillRect(bx, by, bw, bh, face);
+  if (face == COL_BG) {
+    gfx->drawRect(bx, by, bw, bh, ink);
+    gfx->drawRect(bx + 1, by + 1, bw - 2, bh - 2, ink);
+  }
+  gfx->setFont(FONT_TITLE);
+  gfx->setTextDatum(lgfx::textdatum_t::top_center);
+  gfx->setTextColor(ink);
+  gfx->drawString(val, bx + bw / 2, by + 4);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->drawFastHLine(8, y + REM_ROW_H - 1, SCREEN_W - 16, COL_RUST);
+  gfx->endWrite();
+}
+
+static void drawSettingsScreen(const Settings& s, int page) {
+  gfx->fillScreen(COL_BG);
+  drawHeader("SETTINGS");
+  for (int row = 0; row < LIST_ROWS; ++row) drawSettingsRow(s, page, page * LIST_ROWS + row);
+  drawListFooter("TAP TO CHANGE", page, settingsPages());
 }
 
 // ---------------------------------------------------------------- REMINDER ALERT

@@ -141,8 +141,8 @@ static void drawHazardBand(int y, int h) {
 }
 
 // Small grab bar at the top edge: a reminder that swiping down opens the menu.
-static void drawPullHandle() {
-  gfx->fillRect(SCREEN_W / 2 - 22, 1, 44, 3, COL_AMBER_DIM);
+static void drawPullHandle(uint32_t col = COL_AMBER_DIM) {
+  gfx->fillRect(SCREEN_W / 2 - 22, 1, 44, 3, col);
 }
 
 // ---------------------------------------------------------------- full-screen messages
@@ -173,18 +173,117 @@ static const char* const MENU_HINT = "SWIPE DOWN FOR MENU";
 static void drawNoLink()  { drawMessageScreen("NO SIGNAL", "Waiting for the computer.", "Start the companion app.", MENU_HINT); }
 static void drawStandby() { drawMessageScreen("STANDBY", "Nothing is playing.", nullptr, MENU_HINT); }
 
+
+// ---------------------------------------------------------------- music screen colors
+// Every screen uses the THEME colors above. The music screen draws with 'musicPal', which is
+// the same theme unless "album colors" is on; then it is rebuilt from each album cover.
+struct Palette {
+  uint32_t bg, accent, dim, rust, cream;
+  bool operator==(const Palette& o) const { return bg == o.bg && accent == o.accent && dim == o.dim && rust == o.rust && cream == o.cream; }
+};
+static const Palette SYSTEM_PALETTE = { COL_BG, COL_AMBER, COL_AMBER_DIM, COL_RUST, COL_CREAM };
+static Palette musicPal = SYSTEM_PALETTE;
+
+// h in 0..360, s and l in 0..1  ->  0xRRGGBB
+static uint32_t hslColor(float h, float s, float l) {
+  float c = (1 - (l * 2 > 1 ? l * 2 - 1 : 1 - l * 2)) * s;
+  float hp = h / 60.0f;
+  float t = hp - 2 * (int)(hp / 2);
+  float x = c * (1 - (t > 1 ? t - 1 : 1 - t));
+  float r = 0, g = 0, b = 0;
+  switch (((int)hp) % 6) {
+    case 0: r = c; g = x; break;
+    case 1: r = x; g = c; break;
+    case 2: g = c; b = x; break;
+    case 3: g = x; b = c; break;
+    case 4: r = x; b = c; break;
+    default: r = c; b = x; break;
+  }
+  float m = l - c / 2;
+  int R = (int)((r + m) * 255 + 0.5f), G = (int)((g + m) * 255 + 0.5f), B = (int)((b + m) * 255 + 0.5f);
+  return ((uint32_t)R << 16) | ((uint32_t)G << 8) | (uint32_t)B;
+}
+
+static float luma(uint32_t c) {
+  return (0.299f * ((c >> 16) & 255) + 0.587f * ((c >> 8) & 255) + 0.114f * (c & 255)) / 255.0f;
+}
+
+// Same hue, but light enough to read: blues and purples need more lightness than yellows.
+static uint32_t hslReadable(float h, float s, float l, float minLuma) {
+  uint32_t c = hslColor(h, s, l);
+  while (luma(c) < minLuma && l < 0.88f) { l += 0.03f; c = hslColor(h, s, l); }
+  return c;
+}
+
+// Finds the cover's main color and builds a dark background, a bright accent and the in-between
+// tones from it. 'art' is ART_SIZE x ART_SIZE pixels of RGB565, high byte first.
+static Palette paletteFromArt(const uint8_t* art) {
+  static const int BINS = 24;
+  uint32_t weight[BINS] = { 0 }, sumR[BINS] = { 0 }, sumG[BINS] = { 0 }, sumB[BINS] = { 0 };
+  uint32_t samples = 0, colorful = 0;
+  for (int y = 0; y < ART_SIZE; y += 2) {
+    for (int x = 0; x < ART_SIZE; x += 2) {
+      const uint8_t* p = art + ((size_t)y * ART_SIZE + x) * 2;
+      uint16_t v = ((uint16_t)p[0] << 8) | p[1];
+      int r = ((v >> 11) & 31) * 255 / 31, g = ((v >> 5) & 63) * 255 / 63, b = (v & 31) * 255 / 31;
+      int mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+      int mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+      int chroma = mx - mn;
+      ++samples;
+      if (chroma < 45 || mx < 55) continue;          // gray, black or white: no hue to speak of
+      float h;
+      if (mx == r)      h = 60.0f * (g - b) / chroma + (g < b ? 360.0f : 0.0f);
+      else if (mx == g) h = 60.0f * (b - r) / chroma + 120.0f;
+      else              h = 60.0f * (r - g) / chroma + 240.0f;
+      int bin = ((int)(h / (360.0f / BINS))) % BINS;
+      weight[bin] += chroma; sumR[bin] += r * chroma; sumG[bin] += g * chroma; sumB[bin] += b * chroma;
+      ++colorful;
+    }
+  }
+
+  float h = 0, s = 0;
+  if (colorful * 100 >= samples * 6) {
+    int best = 0; uint32_t bestScore = 0;
+    for (int i = 0; i < BINS; ++i) {
+      uint32_t score = weight[i] * 2 + weight[(i + 1) % BINS] + weight[(i + BINS - 1) % BINS];
+      if (score > bestScore) { bestScore = score; best = i; }
+    }
+    float r = (float)sumR[best] / weight[best], g = (float)sumG[best] / weight[best], b = (float)sumB[best] / weight[best];
+    float mx = r > g ? (r > b ? r : b) : (g > b ? g : b);
+    float mn = r < g ? (r < b ? r : b) : (g < b ? g : b);
+    float c = mx - mn;
+    if (c > 1) {
+      if (mx == r)      h = 60.0f * (g - b) / c + (g < b ? 360.0f : 0.0f);
+      else if (mx == g) h = 60.0f * (b - r) / c + 120.0f;
+      else              h = 60.0f * (r - g) / c + 240.0f;
+      float l = (mx + mn) / 510.0f;
+      float d = 1 - (l * 2 > 1 ? l * 2 - 1 : 1 - l * 2);
+      s = d > 0.01f ? (c / 255.0f) / d : 0;
+      if (s > 1) s = 1;
+    }
+  }
+
+  Palette p;
+  p.bg     = hslColor(h, s * 0.60f, 0.09f);
+  p.rust   = hslColor(h, s * 0.55f, 0.19f);
+  p.dim    = hslReadable(h, s * 0.60f, 0.40f, 0.22f);
+  p.accent = hslReadable(h, s * 0.90f, 0.62f, 0.50f);
+  p.cream  = hslColor(h, s * 0.40f, 0.94f);
+  return p;
+}
+
 // ---------------------------------------------------------------- now-playing pieces
 static void drawArt(const UiState& s) {
   gfx->startWrite();
-  gfx->drawRect(ART_X - 2, ART_Y - 2, ART_SIZE + 4, ART_SIZE + 4, COL_AMBER);
-  gfx->drawRect(ART_X - 1, ART_Y - 1, ART_SIZE + 2, ART_SIZE + 2, COL_BG);
+  gfx->drawRect(ART_X - 2, ART_Y - 2, ART_SIZE + 4, ART_SIZE + 4, musicPal.accent);
+  gfx->drawRect(ART_X - 1, ART_Y - 1, ART_SIZE + 2, ART_SIZE + 2, musicPal.bg);
   if (s.artValid && s.art) {
     gfx->pushImage(ART_X, ART_Y, ART_SIZE, ART_SIZE, reinterpret_cast<const lgfx::swap565_t*>(s.art));
   } else {
-    gfx->fillRect(ART_X, ART_Y, ART_SIZE, ART_SIZE, COL_RUST);
+    gfx->fillRect(ART_X, ART_Y, ART_SIZE, ART_SIZE, musicPal.rust);
     gfx->setClipRect(ART_X, ART_Y, ART_SIZE, ART_SIZE);
     for (int d = -ART_SIZE; d < ART_SIZE; d += 14)
-      gfx->drawLine(ART_X + d, ART_Y + ART_SIZE, ART_X + d + ART_SIZE, ART_Y, COL_AMBER_DIM);
+      gfx->drawLine(ART_X + d, ART_Y + ART_SIZE, ART_X + d + ART_SIZE, ART_Y, musicPal.dim);
     gfx->clearClipRect();
   }
   gfx->endWrite();
@@ -192,39 +291,39 @@ static void drawArt(const UiState& s) {
 
 static void drawStatusLabel(const UiState& s) {
   gfx->startWrite();
-  gfx->fillRect(TEXT_X, LABEL_Y, TEXT_W, 9, COL_BG);
+  gfx->fillRect(TEXT_X, LABEL_Y, TEXT_W, 9, musicPal.bg);
   gfx->setFont(FONT_SMALL);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   if (s.playing) {
-    gfx->fillRect(TEXT_X, LABEL_Y, 7, 7, COL_AMBER);
-    gfx->setTextColor(COL_AMBER, COL_BG);
+    gfx->fillRect(TEXT_X, LABEL_Y, 7, 7, musicPal.accent);
+    gfx->setTextColor(musicPal.accent, musicPal.bg);
     gfx->drawString("NOW PLAYING", TEXT_X + 12, LABEL_Y);
   } else {
-    gfx->drawRect(TEXT_X, LABEL_Y, 7, 7, COL_AMBER_DIM);
-    gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+    gfx->drawRect(TEXT_X, LABEL_Y, 7, 7, musicPal.dim);
+    gfx->setTextColor(musicPal.dim, musicPal.bg);
     gfx->drawString("PAUSED", TEXT_X + 12, LABEL_Y);
   }
-  gfx->drawFastHLine(TEXT_X, LABEL_Y + 12, TEXT_W, COL_AMBER_DIM);
+  gfx->drawFastHLine(TEXT_X, LABEL_Y + 12, TEXT_W, musicPal.dim);
   gfx->endWrite();
 }
 
 static void drawTrackText(const UiState& s) {
   gfx->startWrite();
-  gfx->fillRect(TEXT_X, TITLE_Y - 2, SCREEN_W - TEXT_X, BAR_AREA_Y - (TITLE_Y - 2), COL_BG);
+  gfx->fillRect(TEXT_X, TITLE_Y - 2, SCREEN_W - TEXT_X, BAR_AREA_Y - (TITLE_Y - 2), musicPal.bg);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
 
   gfx->setFont(FONT_TITLE);
-  gfx->setTextColor(COL_CREAM, COL_BG);
+  gfx->setTextColor(musicPal.cream, musicPal.bg);
   int y = drawWrapped(s.title[0] ? s.title : "Unknown track", TEXT_X, TITLE_Y, TEXT_W, 3, TITLE_LINE_H);
 
   y += 5;
   gfx->setFont(FONT_BODY);
-  gfx->setTextColor(COL_AMBER, COL_BG);
+  gfx->setTextColor(musicPal.accent, musicPal.bg);
   if (s.artist[0]) y = drawWrapped(s.artist, TEXT_X, y, TEXT_W, 2, BODY_LINE_H);
 
   y += 4;
   gfx->setFont(FONT_SMALL);
-  gfx->setTextColor(COL_AMBER_DIM, COL_BG);
+  gfx->setTextColor(musicPal.dim, musicPal.bg);
   if (s.album[0] && y + 8 <= BAR_AREA_Y - 2) drawWrapped(s.album, TEXT_X, y, TEXT_W, 1, 10);
   gfx->endWrite();
 }
@@ -232,30 +331,30 @@ static void drawTrackText(const UiState& s) {
 // Gauge + elapsed / total time. Drawn into an off-screen strip first so it never flickers.
 static void drawBar(const UiState& s) {
   LGFX_Sprite& b = *barSprite;
-  b.fillScreen(COL_BG);
+  b.fillScreen(musicPal.bg);
 
   bool known = s.hasPos && s.durMs > 0;
   uint32_t pos = s.posMs > s.durMs ? s.durMs : s.posMs;
   int fillPx = known ? (int)((uint64_t)BAR_W * pos / s.durMs) : 0;
 
   for (int x = 0; x + SEG_W <= BAR_W; x += SEG_PITCH)
-    b.fillRect(BAR_X + x, BAR_Y, SEG_W, BAR_H, (known && x + SEG_W / 2 < fillPx) ? COL_AMBER : COL_RUST);
+    b.fillRect(BAR_X + x, BAR_Y, SEG_W, BAR_H, (known && x + SEG_W / 2 < fillPx) ? musicPal.accent : musicPal.rust);
 
   if (known) {
     int hx = BAR_X + fillPx - 4;
     if (hx < BAR_X - 2) hx = BAR_X - 2;
     if (hx > BAR_X + BAR_W - 6) hx = BAR_X + BAR_W - 6;
-    b.fillRect(hx - 1, BAR_Y - 6, 10, BAR_H + 12, COL_BG);
-    b.fillRect(hx, BAR_Y - 5, 8, BAR_H + 10, COL_CREAM);
+    b.fillRect(hx - 1, BAR_Y - 6, 10, BAR_H + 12, musicPal.bg);
+    b.fillRect(hx, BAR_Y - 5, 8, BAR_H + 10, musicPal.cream);
   }
 
   char t[16];
   b.setFont(FONT_BODY);
-  b.setTextColor(COL_AMBER, COL_BG);
+  b.setTextColor(musicPal.accent, musicPal.bg);
   b.setTextDatum(lgfx::textdatum_t::top_left);
   if (known) fmtTime(t, sizeof t, pos); else strcpy(t, "--:--");
   b.drawString(t, BAR_X, BAR_Y + BAR_H + 8);
-  b.setTextColor(COL_AMBER_DIM, COL_BG);
+  b.setTextColor(musicPal.dim, musicPal.bg);
   b.setTextDatum(lgfx::textdatum_t::top_right);
   if (known) fmtTime(t, sizeof t, s.durMs); else strcpy(t, "--:--");
   b.drawString(t, BAR_X + BAR_W, BAR_Y + BAR_H + 8);
@@ -267,14 +366,14 @@ static void drawButton(int which, const UiState& s) {
   int x = BTN_X[which], y = BTN_Y;
   bool down = (s.pressed == which);
   uint32_t face, ink;
-  if (which == ZONE_PLAY) { face = down ? COL_CREAM : COL_AMBER; ink = COL_BG; }
-  else                    { face = down ? COL_AMBER : COL_BG;    ink = down ? COL_BG : COL_AMBER; }
+  if (which == ZONE_PLAY) { face = down ? musicPal.cream : musicPal.accent; ink = musicPal.bg; }
+  else                    { face = down ? musicPal.accent : musicPal.bg;    ink = down ? musicPal.bg : musicPal.accent; }
 
   gfx->startWrite();
   gfx->fillRect(x, y, BTN_W, BTN_H, face);
   if (which != ZONE_PLAY) {
-    gfx->drawRect(x, y, BTN_W, BTN_H, COL_AMBER);
-    gfx->drawRect(x + 1, y + 1, BTN_W - 2, BTN_H - 2, COL_AMBER);
+    gfx->drawRect(x, y, BTN_W, BTN_H, musicPal.accent);
+    gfx->drawRect(x + 1, y + 1, BTN_W - 2, BTN_H - 2, musicPal.accent);
   }
   int cx = x + BTN_W / 2, cy = y + BTN_H / 2;
   if (which == ZONE_PLAY) {
@@ -301,8 +400,8 @@ static void drawButtons(const UiState& s) {
 }
 
 static void drawPlayingScreen(const UiState& s) {
-  gfx->fillScreen(COL_BG);
-  drawPullHandle();
+  gfx->fillScreen(musicPal.bg);
+  drawPullHandle(musicPal.dim);
   drawArt(s);
   drawStatusLabel(s);
   drawTrackText(s);

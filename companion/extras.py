@@ -1,7 +1,10 @@
 """Clock, weather and reminders for the Desk Display.
 
-    settings.json    city for the weather, temperature unit, 12 or 24 hour clock
+    settings.json    city for the weather, plus the Notion details for the calendar
     reminders.txt    one reminder per line; tap one on the display to check it off
+
+Choices like 12/24-hour time and F/C are made in the display's Settings app; the
+display tells the companion what it is set to.
 """
 from __future__ import annotations
 
@@ -15,7 +18,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
-DEFAULT_SETTINGS = {"city": "", "temperature": "F", "clock_24_hour": False}
+DEFAULT_SETTINGS = {"city": "", "notion_token": "", "notion_database_id": "", "notion_date_property": ""}
 
 REMINDERS_TEMPLATE = """# Desk Display reminders. One per line. Save the file and the display updates.
 # Start a line with a time (3:30pm or 15:30) to get a full-screen alert at that time today.
@@ -50,10 +53,10 @@ def fmt_clock(hour: int, minute: int, h24: bool) -> str:
     return f"{hour % 12 or 12}:{minute:02d} {'PM' if hour >= 12 else 'AM'}"
 
 
-def time_payload(h24: bool, now: Optional[datetime.datetime] = None) -> bytes:
+def time_payload(now: Optional[datetime.datetime] = None) -> bytes:
     """Local wall-clock time as seconds since 1970, so the display needs no time zone rules."""
     now = now or datetime.datetime.now()
-    return struct.pack("<IB", calendar.timegm(now.timetuple()), 1 if h24 else 0)
+    return struct.pack("<IB", calendar.timegm(now.timetuple()), 0)
 
 
 # --------------------------------------------------------------------------- weather
@@ -95,46 +98,45 @@ def find_place(city: str):
 
 
 def fetch_weather(settings: dict, place=None):
-    """Returns (place, forecast). 'place' can be passed back in to skip the name lookup."""
+    """Returns (place, forecast in Celsius and km/h). 'place' can be passed back in to skip the name lookup."""
     if place is None:
         if "latitude" in settings and "longitude" in settings:
             place = (settings.get("city") or "WEATHER", settings["latitude"], settings["longitude"])
         else:
             place = find_place(settings["city"])
-    metric = str(settings.get("temperature", "F")).upper().startswith("C")
     url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode({
         "latitude": place[1], "longitude": place[2],
         "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
         "daily": "weather_code,temperature_2m_max,temperature_2m_min",
-        "temperature_unit": "celsius" if metric else "fahrenheit",
-        "wind_speed_unit": "kmh" if metric else "mph",
+        "temperature_unit": "celsius", "wind_speed_unit": "kmh",
         "timezone": "auto", "forecast_days": 3,
     })
     return place, _get_json(url)
 
 
-def weather_payload(place, forecast: dict, settings: dict, to_ascii, now: Optional[datetime.datetime] = None) -> bytes:
-    now = now or datetime.datetime.now()
-    metric = str(settings.get("temperature", "F")).upper().startswith("C")
+def weather_payload(place, forecast: dict, celsius: bool, h24: bool, to_ascii, fetched_at: datetime.datetime) -> bytes:
+    """'forecast' is always metric; it is converted here when the display wants Fahrenheit."""
     cur, daily = forecast["current"], forecast["daily"]
     words, icon = WEATHER_CODES.get(int(cur["weather_code"]), ("", 2))
 
     def deg(v):
-        return str(int(round(float(v))))
+        v = float(v)
+        return str(int(round(v if celsius else v * 9 / 5 + 32)))
 
+    wind = float(cur["wind_speed_10m"])
     lines = [
         b"OK",
         to_ascii(str(place[0]).upper(), 26),
         deg(cur["temperature_2m"]).encode(),
-        b"C" if metric else b"F",
+        b"C" if celsius else b"F",
         words.encode(),
         str(icon).encode(),
         deg(daily["temperature_2m_max"][0]).encode(),
         deg(daily["temperature_2m_min"][0]).encode(),
         deg(cur["apparent_temperature"]).encode(),
-        f"{deg(cur['wind_speed_10m'])} {'KM/H' if metric else 'MPH'}".encode(),
-        f"{deg(cur['relative_humidity_2m'])}%".encode(),
-        fmt_clock(now.hour, now.minute, bool(settings.get("clock_24_hour"))).encode(),
+        (f"{int(round(wind))} KM/H" if celsius else f"{int(round(wind * 0.621371))} MPH").encode(),
+        f"{int(round(float(cur['relative_humidity_2m'])))}%".encode(),
+        fmt_clock(fetched_at.hour, fetched_at.minute, h24).encode(),
     ]
     for i, day in enumerate(daily["time"][:3]):
         name = "TODAY" if i == 0 else datetime.date.fromisoformat(day).strftime("%a").upper()
@@ -147,7 +149,13 @@ def weather_error(message: str) -> bytes:
     return b"ERR\n" + message.encode("ascii", "replace")[:60] + b"\n"
 
 
-DEMO_WEATHER = b"OK\nDEMO CITY\n68\nF\nPARTLY CLOUDY\n1\n72\n55\n66\n8 MPH\n61%\n7:42 AM\nTODAY|1|72|55\nTUE|4|64|52\nWED|0|75|56\n"
+def demo_forecast(today: Optional[datetime.date] = None) -> dict:
+    today = today or datetime.date.today()
+    days = [(today + datetime.timedelta(days=i)).isoformat() for i in range(3)]
+    return {"current": {"temperature_2m": 20.0, "relative_humidity_2m": 61, "apparent_temperature": 19.0,
+                        "weather_code": 2, "wind_speed_10m": 13.0},
+            "daily": {"time": days, "weather_code": [2, 63, 0],
+                      "temperature_2m_max": [22.2, 17.8, 23.9], "temperature_2m_min": [12.8, 11.1, 13.3]}}
 
 
 # --------------------------------------------------------------------------- reminders

@@ -6,6 +6,9 @@
 //   CLOCK      time and date
 //   WEATHER    current conditions and the next days
 //   REMINDERS  a checklist from reminders.txt on the computer, with timed alerts
+//   CALENDAR   the next 7 days from a Notion database
+//   SYSTEM     the computer's CPU, memory, disk and temperatures, plus this board's own
+//   SETTINGS   options for each app, saved on the board
 // Touches are sent back to the computer, which controls the music app and the reminders file.
 //
 // Arduino IDE setup:
@@ -115,6 +118,7 @@
 #endif
 
 #include <Preferences.h>
+#include <math.h>
 #include "protocol.h"
 #include "ui.h"
 #include "apps.h"
@@ -148,6 +152,11 @@ static Weather      weather;
 static ReminderList reminders;
 static int          remPage = 0;
 static Alert        alert;
+static EventList    events;
+static int          evtPage = 0;
+static Stats        stats;
+static Settings     settings;
+static int          setPage = 0;
 
 static const uint32_t LINK_TIMEOUT_MS = 5000;
 
@@ -166,12 +175,59 @@ static uint32_t currentPosMs(uint32_t now) {
   return p;
 }
 
+static void applyBrightness() {
+  static const uint8_t LEVELS[4] = { 64, 128, 191, 255 };
+  int b = LEVELS[settings.brightness & 3];
+  if (appVisible(APP_MUSIC) && !linkUp) b = b * 30 / 100;     // dim the NO SIGNAL screen
+  lcd.setBrightness(b);
+}
+
+// The light on the back of the board. It is lit when its pins are low.
+static void setLight(bool on) {
+  static int last = -1;
+  if ((int)on == last) return;
+  last = on;
+  digitalWrite(4, on ? LOW : HIGH);     // red
+  digitalWrite(16, on ? LOW : HIGH);    // green; red + green together make yellow
+}
+
+// Picks the music screen's colors: from the album cover if that setting is on, otherwise the
+// system look. Returns true if the colors changed.
+static bool refreshMusicPalette() {
+  Palette p = (settings.albumColors && ui.artValid) ? paletteFromArt(artBuf) : SYSTEM_PALETTE;
+  if (p == musicPal) return false;
+  musicPal = p;
+  return true;
+}
+
+// Tells the computer the settings it needs: clock format, weather unit, which alerts to send.
+static void sendSettings() {
+  Serial.printf("DT:SET:H24=%d,WC=%d,RA=%d,CA=%d\n", settings.h24, settings.weatherC, settings.reminderAlerts, settings.eventAlerts);
+}
+
+static void saveSettings() {
+  Preferences prefs;
+  prefs.begin("deskdisplay", false);
+  prefs.putBytes("set", &settings, sizeof settings);
+  prefs.end();
+}
+
+static void updateBoardStats(uint32_t now) {
+  float t = temperatureRead();
+  // Many of these chips have no working sensor and always report 53.3 C.
+  stats.chipTemp = (isnan(t) || fabsf(t - 53.33f) < 0.2f) ? STAT_UNKNOWN : (int)lroundf(t);
+  stats.uptimeSec = now / 1000;
+  stats.freeKb = ESP.getFreeHeap() / 1024;
+  stats.linkUp = linkUp;
+  if (!linkUp) stats.pcValid = false;
+}
+
 // Redraws the whole screen for whatever should be showing right now.
 static void showCurrent() {
   uint32_t now = millis();
   scrubbing = false;
   ui.pressed = ZONE_NONE;
-  lcd.setBrightness((appVisible(APP_MUSIC) && !linkUp) ? 70 : 255);
+  applyBrightness();
 
   if (alertOpen) { drawAlert(alert); return; }
   if (menuOpen)  { drawMenu(app); return; }
@@ -187,6 +243,17 @@ static void showCurrent() {
     case APP_REMINDERS:
       if (remPage >= reminderPages(reminders)) remPage = 0;
       drawRemindersScreen(reminders, remPage);
+      break;
+    case APP_CALENDAR:
+      if (evtPage >= eventPages(events)) evtPage = 0;
+      drawCalendarScreen(events, evtPage);
+      break;
+    case APP_SYSTEM:
+      updateBoardStats(now);
+      drawSystemScreen(stats, settings);
+      break;
+    case APP_SETTINGS:
+      drawSettingsScreen(settings, setPage);
       break;
     default:
       if (musicView() == VIEW_NOLINK)       drawNoLink();
@@ -229,6 +296,7 @@ static void handleFrame() {
   switch (type) {
     case 'H':
       Serial.print("DT:READY:1\n");
+      sendSettings();
       break;
 
     case 'M':
@@ -272,25 +340,25 @@ static void handleFrame() {
 
     case 'A':
       ui.artValid = true;
-      if (partial) drawArt(ui);
+      if (refreshMusicPalette()) { if (partial) showCurrent(); }   // new album colors: repaint it all
+      else if (partial) drawArt(ui);
       break;
 
     case 'X':
       hasTrack = false;
       ui.artValid = false;
       ui.title[0] = ui.artist[0] = ui.album[0] = 0;
+      musicPal = SYSTEM_PALETTE;
       break;
 
     case 'T': {
       if (parser->length() < 5) break;
       const uint8_t* p = parser->payload();
       bool wasKnown = clockState.known;
-      bool was24 = clockState.h24;
       clockSyncEpoch = readU32(p);
       clockSyncAtMs  = now;
-      clockState.h24 = p[4] & 0x01;
       clockState.known = true;
-      if (appVisible(APP_CLOCK) && (!wasKnown || was24 != clockState.h24)) showCurrent();
+      if (appVisible(APP_CLOCK) && !wasKnown) showCurrent();
       break;
     }
 
@@ -302,6 +370,16 @@ static void handleFrame() {
     case 'R':
       parseReminders(text, reminders);
       if (appVisible(APP_REMINDERS)) showCurrent();
+      break;
+
+    case 'E':
+      parseEvents(text, events);
+      if (appVisible(APP_CALENDAR)) showCurrent();
+      break;
+
+    case 'Y':
+      parseStats(text, stats);
+      if (appVisible(APP_SYSTEM)) { updateBoardStats(now); drawSystemValues(stats, settings); }
       break;
 
     case 'N':
@@ -340,6 +418,19 @@ static int  pressedTile = -1;
 static const int SWIPE_MIN = 45;     // pixels a finger must travel to count as a swipe
 static const int TAP_MAX   = 18;     // pixels a finger may wander and still count as a tap
 
+// A row in the Settings app was tapped: change it, save it, and make it take effect.
+static void changeSetting(int i) {
+  settingAdvance(settings, i);
+  saveSettings();
+  drawSettingsRow(settings, setPage, i);
+  switch (i) {
+    case 0: refreshMusicPalette(); break;
+    case 1: clockState.h24 = settings.h24; sendSettings(); break;
+    case 2: case 3: case 4: sendSettings(); break;
+    case 6: applyBrightness(); break;
+  }
+}
+
 static void onTap(int x, int y) {
   if (menuOpen) {
     int t = menuTileAt(x, y);
@@ -362,6 +453,13 @@ static void onTap(int x, int y) {
       drawReminderRow(reminders, remPage, i);
       Serial.printf("DT:CMD:REM:%d\n", i);
     }
+  } else if (app == APP_CALENDAR && events.valid) {
+    int pages = eventPages(events);
+    if (y >= REM_FOOT_Y && pages > 1) { evtPage = (evtPage + 1) % pages; showCurrent(); }
+  } else if (app == APP_SETTINGS) {
+    int i = settingAt(setPage, y);
+    if (i == -2) { setPage = (setPage + 1) % settingsPages(); showCurrent(); }
+    else if (i >= 0) changeSetting(i);
   }
 }
 
@@ -508,6 +606,10 @@ static void setupTouchCalibration() {
   }
   uint8_t saved = prefs.getUChar("app", 0);
   app = (App)(saved < APP_COUNT ? saved : 0);
+  Settings stored;
+  if (prefs.getBytes("set", &stored, sizeof stored) == sizeof stored && stored.version == settings.version) settings = stored;
+  settings.brightness &= 3;
+  clockState.h24 = settings.h24;
   prefs.end();
 }
 
@@ -542,6 +644,7 @@ void setup() {
 
   showCurrent();
   Serial.print("\nDT:READY:1\n");
+  sendSettings();
 }
 
 void loop() {
@@ -553,6 +656,18 @@ void loop() {
   if (linkUp && now - lastFrameMs > LINK_TIMEOUT_MS) {
     linkUp = false;
     if (appVisible(APP_MUSIC)) showCurrent();
+  }
+
+  // Blink the light on the back while a reminder or event alert is on screen.
+  setLight(alertOpen && settings.alertLight && (now / 350) % 2 == 0);
+
+  if (appVisible(APP_SYSTEM)) {
+    static uint32_t lastStatsMs = 0;
+    if (now - lastStatsMs >= 1000) {
+      lastStatsMs = now;
+      updateBoardStats(now);
+      drawSystemValues(stats, settings);
+    }
   }
 
   if (playingVisible()) {
