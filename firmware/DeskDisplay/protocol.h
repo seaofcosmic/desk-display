@@ -17,6 +17,7 @@
 //   type 'N'  alert            "time\ntext"   (a timed reminder or an upcoming calendar event)
 //   type 'E'  calendar         text lines, see parseEvents() in apps.h
 //   type 'Y'  computer stats   text lines, see parseStats() in apps.h
+//   type 'V'  sound levels     16 bytes, one per visualizer bar, 0 (silent) to 255, lowest notes first
 //
 // Display -> computer (text lines):
 //   DT:READY:1   DT:CMD:PLAY   DT:CMD:NEXT   DT:CMD:PREV   DT:CMD:SEEK:<ms>   DT:NAK:A

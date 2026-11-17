@@ -23,6 +23,7 @@ struct Weather {
   int  icon = 2;
   char hi[8] = "", lo[8] = "", feels[8] = "", wind[14] = "", hum[8] = "", updated[12] = "";
   bool night = false;
+  int  sunrise = -1, sunset = -1;      // minutes after midnight, -1 = not known
   WeatherDay days[3];
 };
 
@@ -59,7 +60,7 @@ struct Stats {
 
 // Everything the Settings app can change. Saved on the board.
 struct Settings {
-  uint8_t version     = 2;
+  uint8_t version     = 3;
   bool fullColor      = true;    // DISPLAY: the look. false = Minimal (amber), true = Full color
   bool albumColors    = true;    // MUSIC: in Full color, take the music screen's colors from the cover
   bool h24            = false;   // CLOCK: 24-hour time (also used for times in other apps)
@@ -69,6 +70,8 @@ struct Settings {
   bool statsF         = false;   // SYSTEM: Fahrenheit instead of Celsius
   uint8_t brightness  = 3;       // DISPLAY: 0..3 = 25, 50, 75, 100 %
   bool alertLight     = true;    // DISPLAY: blink the light on the back during an alert
+  bool fullArt        = true;    // MUSIC: switch to the full-screen cover after a few seconds
+  uint8_t saver       = 2;       // DISPLAY: screensaver after 0 = never, 1 = 1, 2 = 5, 3 = 15 minutes
 };
 
 // ---------------------------------------------------------------- reading the text messages
@@ -85,8 +88,10 @@ static void takeLine(char* dst, size_t n, const char*& p) {       // up to the e
   if (*p == '\n') ++p;
 }
 
-// "OK" city temp unit condition icon high low feels wind humidity updated D-or-N (day/night), one per line,
+// "OK" city temp unit condition icon high low feels wind humidity updated sun, one per line,
 // then up to three lines of "day|icon|high|low".   Or: "ERR" and a message line.
+// The sun line is "D" (day) or "N" (night), optionally followed by "|sunrise|sunset" in minutes
+// after midnight, for example "D|387|1012".
 static void parseWeather(const char* p, Weather& w) {
   char tmp[16];
   takeLine(tmp, sizeof tmp, p);
@@ -107,7 +112,16 @@ static void parseWeather(const char* p, Weather& w) {
   takeLine(w.wind, sizeof w.wind, p);
   takeLine(w.hum, sizeof w.hum, p);
   takeLine(w.updated, sizeof w.updated, p);
-  takeLine(tmp, sizeof tmp, p); w.night = (tmp[0] == 'N');
+  char sun[24];
+  takeLine(sun, sizeof sun, p);
+  const char* q = sun;
+  takeField(tmp, sizeof tmp, q); w.night = (tmp[0] == 'N');
+  w.sunrise = w.sunset = -1;
+  if (*q) {
+    takeField(tmp, sizeof tmp, q); int rise = atoi(tmp);
+    takeField(tmp, sizeof tmp, q); int set = atoi(tmp);
+    if (rise >= 0 && set > rise && set < 1440) { w.sunrise = rise; w.sunset = set; }
+  }
   for (int i = 0; i < 3; ++i) {
     WeatherDay& d = w.days[i];
     takeField(d.name, sizeof d.name, p);
@@ -186,6 +200,52 @@ static Palette clockPalette(uint32_t epoch) {
   if (hour >= 8 && hour < 17)  return paletteFromHS(208, 0.70f);
   if (hour >= 17 && hour < 20) return paletteFromHS(300, 0.50f);
   return paletteFromHS(232, 0.60f);
+}
+
+// ---------------------------------------------------------------- the sky right now
+// Sunrise and sunset come with the weather. Without them the sky assumes 6:30 and 18:30.
+static const int GLOW_MINUTES = 35;        // the sky is orange and pink this long before and after each
+
+static void sunTimes(const Weather& w, int& rise, int& set) {
+  if (w.valid && w.sunrise >= 0) { rise = w.sunrise; set = w.sunset; }
+  else { rise = 6 * 60 + 30; set = 18 * 60 + 30; }
+}
+
+static int skyPhase(const Weather& w, const ClockState& c) {
+  bool haveSun = w.valid && w.sunrise >= 0;
+  if (!c.known || (w.valid && !haveSun)) return (w.valid && w.night) ? PHASE_NIGHT : PHASE_DAY;
+  int rise, set; sunTimes(w, rise, set);
+  int m = (int)((c.epoch / 60) % 1440);
+  if (abs(m - rise) <= GLOW_MINUTES) return PHASE_DAWN;
+  if (abs(m - set) <= GLOW_MINUTES)  return PHASE_DUSK;
+  return (m > rise && m < set) ? PHASE_DAY : PHASE_NIGHT;
+}
+
+// The sky for the weather as it is, with the sun in its usual corner.
+static SceneInfo skyInfo(const Weather& w, const ClockState& c) {
+  SceneInfo info;
+  info.kind = w.valid ? w.icon : 0;
+  info.phase = skyPhase(w, c);
+  return info;
+}
+
+// Moves the sun (or the moon, at night) to where it is on its arc across the top of the screen:
+// rising at the left, highest in the middle of the day or night, setting at the right.
+static void sunOnArc(const Weather& w, const ClockState& c, SceneInfo& info) {
+  int rise, set; sunTimes(w, rise, set);
+  int m = c.known ? (int)((c.epoch / 60) % 1440) : 12 * 60;
+  float f;
+  if (info.phase != PHASE_NIGHT) {
+    f = (float)(m - rise) / (float)(set - rise);
+  } else {
+    int since = m >= set ? m - set : m + 1440 - set;
+    f = (float)since / (float)(1440 - (set - rise));
+  }
+  if (f < 0) f = 0;
+  if (f > 1) f = 1;
+  info.sunX = 36 + (int)lroundf(f * 248);
+  info.sunY = 66 - (int)lroundf(sinf(f * 3.14159265f) * 32);
+  info.sunR = 18;
 }
 
 // ---------------------------------------------------------------- shared pieces
@@ -385,7 +445,8 @@ static void drawClockTime(const ClockState& c) {
   gfx->setFont(FONT_BIG);
   gfx->setTextSize(1);
   int aw = ampm ? gfx->textWidth(ampm) + 8 : 0;
-  int x = (SCREEN_W - tw - aw) / 2;
+  int lead = t[0] == '1' ? 40 : 0;          // a leading 1 is drawn at the right of its space; skip the empty part
+  int x = (SCREEN_W - (tw - lead) - aw) / 2 - lead;
 
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->setFont(&fonts::Font7);
@@ -429,6 +490,32 @@ static void drawClockDate(const ClockState& c) {
   gfx->drawString(d, SCREEN_W / 2, CLOCK_DATE_Y);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->endWrite();
+}
+
+// ---- Full color look: the time sits on the animated sky, with the sun or moon crossing it.
+static bool clockImmersive(const ClockState& c) { return fullColorMode && sceneReady && c.known; }
+
+static void clockTimeText(const ClockState& c, char* time, size_t n, const char*& ampm) {
+  struct tm tmv; clockParts(c.epoch, tmv);
+  int h = tmv.tm_hour;
+  ampm = "";
+  if (!c.h24) { ampm = h >= 12 ? "PM" : "AM"; h %= 12; if (h == 0) h = 12; }
+  snprintf(time, n, c.h24 ? "%02d:%02d" : "%d:%02d", h, tmv.tm_min);
+}
+
+static void drawClockSky(const ClockState& c, const Weather& w, bool advance) {
+  SceneInfo info = skyInfo(w, c);
+  sunOnArc(w, c, info);
+  sceneRender(info, advance);
+
+  struct tm tmv; clockParts(c.epoch, tmv);
+  char t[8], sec[6], d[40];
+  const char* ampm;
+  clockTimeText(c, t, sizeof t, ampm);
+  snprintf(sec, sizeof sec, ":%02d", tmv.tm_sec);
+  snprintf(d, sizeof d, "%s  %s %d", DAY_NAMES[tmv.tm_wday % 7], MONTH_NAMES[tmv.tm_mon % 12], tmv.tm_mday);
+  sceneClockWords(t, ampm, sec, d);
+  sceneShow();
 }
 
 static void drawClockScreen(const ClockState& c) {
@@ -480,30 +567,21 @@ static void drawWeatherNow(const Weather& w) {
 
 // ---- Full color look: the whole screen is the animated sky. Swiping up shows the details
 // ---- on a blurred copy of that sky.
-static SceneState weatherScene;
-
-static SceneInfo weatherSceneInfo(const Weather& w) {
-  SceneInfo info;
-  info.kind = w.icon; info.night = w.night;
-  info.city = w.city; info.temp = w.temp; info.unit = w.unit; info.cond = w.cond; info.hi = w.hi; info.lo = w.lo;
-  return info;
-}
 
 // Draws the sky. advance = true also moves the clouds, rain and so on by one step.
-static void drawWeatherSky(const Weather& w, bool advance) {
-  if (weatherScene.kind != w.icon || weatherScene.night != w.night) sceneStart(weatherScene, w.icon, w.night);
-  else if (advance) sceneStep(weatherScene);
-  sceneDraw(weatherScene, weatherSceneInfo(w));
+static void drawWeatherSky(const Weather& w, const ClockState& c, bool advance) {
+  sceneRender(skyInfo(w, c), advance);
+  sceneWeatherWords(w.city, w.temp, w.unit, w.cond, w.hi, w.lo);
+  sceneShow();
 }
 
-static void drawWeatherDetails(const Weather& w) {
+static void drawWeatherDetails(const Weather& w, const ClockState& c) {
   static const uint32_t WHITE = 0xFFFFFF, SOFT = 0xC9D6E6, LINE = 0x7C8A9E, ICON_BG = 0x151B26;
   char buf[40];
 
   // the backdrop: the sky alone, out of focus and darkened
-  if (weatherScene.kind != w.icon || weatherScene.night != w.night) sceneStart(weatherScene, w.icon, w.night);
-  sceneDraw(weatherScene, weatherSceneInfo(w), false, false);
-  if (!sceneBlurToScreen(gfx, 45)) gfx->fillScreen(pal.bg);
+  sceneRender(skyInfo(w, c), false);
+  if (!sceneBlurToScreen(45)) gfx->fillScreen(pal.bg);
 
   gfx->startWrite();
   gfx->fillRect(SCREEN_W / 2 - 22, 1, 44, 3, SOFT);
@@ -570,13 +648,13 @@ static void drawWeatherDetails(const Weather& w) {
 // True when the Weather app should be the full-screen sky.
 static bool weatherImmersive(const Weather& w) { return fullColorMode && sceneReady && w.valid; }
 
-static void drawWeatherScreen(const Weather& w) {
+static void drawWeatherScreen(const Weather& w, const ClockState& c) {
   if (!w.valid) {
     drawMessageScreen("WEATHER", w.error, nullptr, MENU_HINT);
     return;
   }
   if (weatherImmersive(w)) {
-    drawWeatherSky(w, false);
+    drawWeatherSky(w, c, false);
     return;
   }
   char buf[40];
@@ -821,14 +899,18 @@ static void drawSystemScreen(const Stats& st, const Settings& set) {
 }
 
 // ---------------------------------------------------------------- SETTINGS
-static const int SETTING_COUNT = 9;
+static const int SETTING_COUNT = 11;
+enum SettingRow { SET_LOOK, SET_ALBUM_COLORS, SET_FULL_ART, SET_TIME, SET_WEATHER_UNIT, SET_REMINDER_ALERTS,
+                  SET_EVENT_ALERTS, SET_STATS_UNIT, SET_BRIGHTNESS, SET_SAVER, SET_LIGHT };
 static const char* const SETTING_APP[SETTING_COUNT]  = {
-  "DISPLAY", "MUSIC, IN THE FULL COLOR LOOK", "CLOCK", "WEATHER", "REMINDERS", "CALENDAR", "SYSTEM", "DISPLAY", "DISPLAY",
+  "DISPLAY", "MUSIC, IN THE FULL COLOR LOOK", "MUSIC", "CLOCK", "WEATHER", "REMINDERS", "CALENDAR", "SYSTEM",
+  "DISPLAY", "DISPLAY", "DISPLAY",
 };
 static const char* const SETTING_NAME[SETTING_COUNT] = {
-  "Look", "Album colors", "Time format", "Temperature", "Timed alerts", "Alert before events", "Temperature", "Brightness",
-  "Alert light on the back",
+  "Look", "Album colors", "Full-screen cover", "Time format", "Temperature", "Timed alerts", "Alert before events",
+  "Temperature", "Brightness", "Screensaver", "Alert light on the back",
 };
+static const uint8_t SAVER_MINUTES[4] = { 0, 1, 5, 15 };
 
 static int settingsPages() { return (SETTING_COUNT + LIST_ROWS - 1) / LIST_ROWS; }
 
@@ -836,15 +918,19 @@ static int settingsPages() { return (SETTING_COUNT + LIST_ROWS - 1) / LIST_ROWS;
 static void settingValue(const Settings& s, int i, char* out, size_t n, bool& isSwitch, bool& on) {
   isSwitch = true; on = false;
   switch (i) {
-    case 0: isSwitch = false; snprintf(out, n, s.fullColor ? "FULL COLOR" : "MINIMAL"); return;
-    case 1: on = s.albumColors; break;
-    case 2: isSwitch = false; snprintf(out, n, s.h24 ? "24 H" : "12 H"); return;
-    case 3: isSwitch = false; snprintf(out, n, s.weatherC ? "C" : "F"); return;
-    case 4: on = s.reminderAlerts; break;
-    case 5: on = s.eventAlerts; break;
-    case 6: isSwitch = false; snprintf(out, n, s.statsF ? "F" : "C"); return;
-    case 7: isSwitch = false; snprintf(out, n, "%d%%", (s.brightness + 1) * 25); return;
-    case 8: on = s.alertLight; break;
+    case SET_LOOK:            isSwitch = false; snprintf(out, n, s.fullColor ? "FULL COLOR" : "MINIMAL"); return;
+    case SET_ALBUM_COLORS:    on = s.albumColors; break;
+    case SET_FULL_ART:        on = s.fullArt; break;
+    case SET_TIME:            isSwitch = false; snprintf(out, n, s.h24 ? "24 H" : "12 H"); return;
+    case SET_WEATHER_UNIT:    isSwitch = false; snprintf(out, n, s.weatherC ? "C" : "F"); return;
+    case SET_REMINDER_ALERTS: on = s.reminderAlerts; break;
+    case SET_EVENT_ALERTS:    on = s.eventAlerts; break;
+    case SET_STATS_UNIT:      isSwitch = false; snprintf(out, n, s.statsF ? "F" : "C"); return;
+    case SET_BRIGHTNESS:      isSwitch = false; snprintf(out, n, "%d%%", (s.brightness + 1) * 25); return;
+    case SET_SAVER:
+      if (s.saver & 3) { isSwitch = false; snprintf(out, n, "%d MIN", SAVER_MINUTES[s.saver & 3]); return; }
+      break;                                                    // off: drawn as a switch that is off
+    case SET_LIGHT:           on = s.alertLight; break;
   }
   snprintf(out, n, on ? "ON" : "OFF");
 }
@@ -852,15 +938,17 @@ static void settingValue(const Settings& s, int i, char* out, size_t n, bool& is
 // Tapping a row moves it to its next value.
 static void settingAdvance(Settings& s, int i) {
   switch (i) {
-    case 0: s.fullColor = !s.fullColor; break;
-    case 1: s.albumColors = !s.albumColors; break;
-    case 2: s.h24 = !s.h24; break;
-    case 3: s.weatherC = !s.weatherC; break;
-    case 4: s.reminderAlerts = !s.reminderAlerts; break;
-    case 5: s.eventAlerts = !s.eventAlerts; break;
-    case 6: s.statsF = !s.statsF; break;
-    case 7: s.brightness = (s.brightness + 1) % 4; break;
-    case 8: s.alertLight = !s.alertLight; break;
+    case SET_LOOK:            s.fullColor = !s.fullColor; break;
+    case SET_ALBUM_COLORS:    s.albumColors = !s.albumColors; break;
+    case SET_FULL_ART:        s.fullArt = !s.fullArt; break;
+    case SET_TIME:            s.h24 = !s.h24; break;
+    case SET_WEATHER_UNIT:    s.weatherC = !s.weatherC; break;
+    case SET_REMINDER_ALERTS: s.reminderAlerts = !s.reminderAlerts; break;
+    case SET_EVENT_ALERTS:    s.eventAlerts = !s.eventAlerts; break;
+    case SET_STATS_UNIT:      s.statsF = !s.statsF; break;
+    case SET_BRIGHTNESS:      s.brightness = (s.brightness + 1) % 4; break;
+    case SET_SAVER:           s.saver = (s.saver + 1) % 4; break;
+    case SET_LIGHT:           s.alertLight = !s.alertLight; break;
   }
 }
 
@@ -913,6 +1001,56 @@ static void drawSettingsScreen(const Settings& s, int page) {
   drawHeader("SETTINGS");
   for (int row = 0; row < LIST_ROWS; ++row) drawSettingsRow(s, page, page * LIST_ROWS + row);
   drawListFooter("TAP TO CHANGE", page, settingsPages());
+}
+
+// ---------------------------------------------------------------- SCREENSAVER
+// With no music playing: the sky for the current weather and time of day (stars at night, rain
+// when it rains) with a small clock drifting around it. In the Minimal look the sky is black
+// with amber stars. While music plays the cover floats around instead (see ui.h).
+struct SaverState { float x = 60, y = 70, dx = 0.55f, dy = 0.35f; int shownX = -1, shownY = -1; };
+
+static void saverMove(SaverState& sv) {
+  sv.x += sv.dx; sv.y += sv.dy;
+  if (sv.x < 6 || sv.x > SCREEN_W - SAVER_BOX_W - 6) { sv.dx = -sv.dx; sv.x += 2 * sv.dx; }
+  if (sv.y < 6 || sv.y > SCREEN_H - SAVER_BOX_H - 6) { sv.dy = -sv.dy; sv.y += 2 * sv.dy; }
+}
+
+static void saverWords(const ClockState& c, char* t, size_t tn, char* d, size_t dn) {
+  struct tm tmv; clockParts(c.epoch, tmv);
+  const char* ampm;
+  clockTimeText(c, t, tn, ampm);
+  snprintf(d, dn, "%s  %s %d  %s", DAY_NAMES[tmv.tm_wday % 7], MONTH_NAMES[tmv.tm_mon % 12], tmv.tm_mday, ampm);
+}
+
+static void drawSaverSky(const ClockState& c, const Weather& w, SaverState& sv, bool advance) {
+  if (advance) saverMove(sv);
+  char t[8], d[40];
+  if (!sceneReady) {                                   // no room for the sky picture: just the drifting clock
+    int x = (int)sv.x, y = (int)sv.y;
+    if (!advance) gfx->fillScreen(COL_BG);
+    else if (x == sv.shownX && y == sv.shownY) return;
+    else if (sv.shownX >= 0) gfx->fillRect(sv.shownX, sv.shownY, SAVER_BOX_W, SAVER_BOX_H, COL_BG);
+    sv.shownX = x; sv.shownY = y;
+    if (!c.known) return;
+    saverWords(c, t, sizeof t, d, sizeof d);
+    gfx->setTextDatum(lgfx::textdatum_t::top_left);
+    gfx->setFont(&fonts::Font7);
+    gfx->setTextColor(COL_AMBER);
+    gfx->drawString(t, x, y);
+    gfx->setFont(FONT_SMALL);
+    gfx->setTextColor(COL_AMBER_DIM);
+    gfx->drawString(d, x + 2, y + 58);
+    return;
+  }
+  SceneInfo info = skyInfo(w, c);
+  sunOnArc(w, c, info);
+  if (!fullColorMode) { info.kind = 0; info.plain = true; info.plainInk = COL_AMBER; }
+  sceneRender(info, advance);
+  if (c.known) {
+    saverWords(c, t, sizeof t, d, sizeof d);
+    sceneSaverWords(t, d, (int)sv.x, (int)sv.y);
+  }
+  sceneShow();
 }
 
 // ---------------------------------------------------------------- REMINDER ALERT

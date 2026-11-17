@@ -1,12 +1,16 @@
-// scene.h - the full-screen animated sky of the Weather app in the Full color look.
+// scene.h - the full-screen animated sky used in the Full color look by the Weather app,
+// the Clock app and the screensaver.
+//
 // Sunny: blue sky and a turning sun. Rain: drifting clouds and falling pixel rain.
-// Thunder: darker clouds, heavier rain and lightning. Also cloudy, fog, snow and clear nights.
+// Thunder: darker clouds, heavier rain and lightning. Also cloudy, fog, snow, clear nights
+// with a moon and stars, and orange-and-pink skies around sunrise and sunset.
 //
 // The sky is drawn in a 16-color picture the size of the screen and copied to the screen about
 // 11 times a second. Each name in SceneColor is a slot in that 16-color palette; sceneColors()
-// fills the slots for the current weather, so recoloring a scene only means changing that function.
+// fills the slots for the current weather and time of day, so recoloring a sky only means
+// changing that function.
 //
-// sceneBlurToScreen() paints a blurred, darkened copy of the sky, used behind the details.
+// sceneBlurToScreen() paints a blurred, darkened copy of the sky, used behind the weather details.
 #pragma once
 #include "ui.h"
 #include <math.h>
@@ -20,23 +24,22 @@ enum SceneColor {
   SC_BOLT, SC_TEXT, SC_TEXT_SOFT, SC_SHADOW, SC_STAR, SC_FOG, SC_COUNT
 };
 
-// What to show. kind uses the same numbers as the weather icons:
+enum SkyPhase { PHASE_DAY, PHASE_NIGHT, PHASE_DAWN, PHASE_DUSK };
+
+// What sky to show. kind uses the same numbers as the weather icons:
 // 0 clear, 1 partly cloudy, 2 cloudy, 3 fog, 4 rain, 5 snow, 6 storm.
 struct SceneInfo {
   int kind = 0;
-  bool night = false;
-  const char* city = "";
-  const char* temp = "";
-  const char* unit = "F";
-  const char* cond = "";
-  const char* hi = "";
-  const char* lo = "";
+  int phase = PHASE_DAY;
+  int sunX = 250, sunY = 62, sunR = 30;     // where the sun (or the moon, at night) sits, and its size
+  bool plain = false;                       // Minimal look: a black sky drawn in one color
+  uint32_t plainInk = 0xEF9F27;
 };
 
 static const int SCENE_DROPS = 150, SCENE_CLOUDS = 6, SCENE_STARS = 48, SCENE_BOLT_POINTS = 9;
 struct SceneState {
-  int kind = -1;
-  bool night = false;
+  int kind = -1, phase = -1;
+  bool plain = false;
   uint32_t frame = 0;
   uint32_t rng = 12345;
   float cloudX[SCENE_CLOUDS];
@@ -51,8 +54,8 @@ struct SceneState {
 static LGFX_Sprite* sceneSprite = nullptr;
 static uint32_t sceneSky[3];
 static uint32_t scenePalette[16];      // what each slot is currently set to, as 0xRRGGBB
-
 static bool sceneReady = false;        // false if there was not enough memory for the sky picture
+static SceneState sky;                 // the one sky that is on screen at any time
 
 static bool sceneBegin(lgfx::LovyanGFX* screen) {
   sceneSprite = new LGFX_Sprite(screen);
@@ -78,9 +81,12 @@ static void sceneSetSky(uint32_t top, uint32_t mid, uint32_t low) {
   sceneSet(SC_SKY_LOW, low);
 }
 
-// ---------------------------------------------------------------- colors for each kind of weather
-static void sceneColors(int kind, bool night) {
-  uint32_t cloud = 0xF2F5F8, shade = 0xC2CCD9, drop = 0x9CC4F5;
+// ---------------------------------------------------------------- colors for each sky
+static void sceneColors(const SceneInfo& info) {
+  int kind = info.kind;
+  bool night = info.phase == PHASE_NIGHT;
+  bool glow = info.phase == PHASE_DAWN || info.phase == PHASE_DUSK;      // sunrise or sunset
+  uint32_t cloud = 0xF2F5F8, shade = 0xC2CCD9, drop = 0x9CC4F5, sun = 0xFFD23F, ray = 0xFFB000;
   switch (kind) {
     case 0: case 1: sceneSky[0] = 0x1E6FD9; sceneSky[1] = 0x3F8FE8; sceneSky[2] = 0x6FB4F2; break;   // sunny blue
     case 2:         sceneSky[0] = 0x55667A; sceneSky[1] = 0x697A8E; sceneSky[2] = 0x8190A3; cloud = 0xDDE3EA; shade = 0xAEB8C6; break;
@@ -89,27 +95,40 @@ static void sceneColors(int kind, bool night) {
     case 5:         sceneSky[0] = 0x2E3A4D; sceneSky[1] = 0x3D4B61; sceneSky[2] = 0x52627A; cloud = 0xA9B4C4; shade = 0x7F8B9E; drop = 0xFFFFFF; break;
     default:        sceneSky[0] = 0x15131F; sceneSky[1] = 0x211C33; sceneSky[2] = 0x2D2647; cloud = 0x545170; shade = 0x38364F; break;
   }
-  if (night && kind <= 2) {
+  if (kind <= 2 && night) {                                 // clear or cloudy night
     sceneSky[0] = 0x070B1F; sceneSky[1] = 0x0D1433; sceneSky[2] = 0x152047;
-    cloud = 0x39425A; shade = 0x2A3147;
+    cloud = 0x39425A; shade = 0x2A3147; sun = 0xE8E6D8;     // the moon uses the sun's slot
+  } else if (kind <= 1 && glow) {                           // sunrise and sunset: indigo, salmon, peach
+    sceneSky[0] = 0x3F4F9A; sceneSky[1] = 0xE0806C; sceneSky[2] = 0xFFBE78;
+    cloud = 0xFBD9CF; shade = 0xDDA2A0; sun = 0xFF8A2A; ray = 0xFFB45A;
+  } else if (kind == 2 && glow) {                           // the same hour under cloud: mauve
+    sceneSky[0] = 0x57506E; sceneSky[1] = 0x8C7280; sceneSky[2] = 0xB8958A;
+    cloud = 0xD9C6CC; shade = 0xB29AA6;
+  }
+  uint32_t text = 0xFFFFFF, soft = 0xE3ECF7, shadow = 0x0A0E18, star = 0xFFFFFF, fog = 0xB4BAC2, bolt = 0xFFF7B0;
+  if (info.plain) {                                         // Minimal look: everything in one color on black
+    sceneSky[0] = sceneSky[1] = sceneSky[2] = 0x0E0C0A;
+    cloud = shade = drop = sun = ray = star = fog = bolt = text = soft = info.plainInk;
+    shadow = 0x0E0C0A;
   }
   sceneSetSky(sceneSky[0], sceneSky[1], sceneSky[2]);
   sceneSet(SC_CLOUD, cloud);
   sceneSet(SC_CLOUD_SHADE, shade);
   sceneSet(SC_DROP, drop);
-  sceneSet(SC_SUN, night ? 0xE8E6D8u : 0xFFD23Fu);      // the moon uses the sun's slot at night
-  sceneSet(SC_RAY, 0xFFB000u);
-  sceneSet(SC_BOLT, 0xFFF7B0u);
-  sceneSet(SC_TEXT, 0xFFFFFFu);
-  sceneSet(SC_TEXT_SOFT, 0xE3ECF7u);
-  sceneSet(SC_SHADOW, 0x0A0E18u);
-  sceneSet(SC_STAR, 0xFFFFFFu);
-  sceneSet(SC_FOG, 0xB4BAC2u);
+  sceneSet(SC_SUN, sun);
+  sceneSet(SC_RAY, ray);
+  sceneSet(SC_BOLT, bolt);
+  sceneSet(SC_TEXT, text);
+  sceneSet(SC_TEXT_SOFT, soft);
+  sceneSet(SC_SHADOW, shadow);
+  sceneSet(SC_STAR, star);
+  sceneSet(SC_FOG, fog);
 }
 
 // The color family that goes with this sky (used for the details view): its hue and strength.
-static void sceneHue(int kind, bool night, float& hue, float& sat) {
-  if (night && kind <= 2) { hue = 230; sat = 0.60f; return; }
+static void sceneHue(int kind, int phase, float& hue, float& sat) {
+  if (kind <= 2 && phase == PHASE_NIGHT) { hue = 230; sat = 0.60f; return; }
+  if (kind <= 1 && (phase == PHASE_DAWN || phase == PHASE_DUSK)) { hue = 16; sat = 0.60f; return; }
   switch (kind) {
     case 0: case 1: hue = 208; sat = 0.75f; break;
     case 2:         hue = 212; sat = 0.25f; break;
@@ -120,22 +139,23 @@ static void sceneHue(int kind, bool night, float& hue, float& sat) {
   }
 }
 
-// ---------------------------------------------------------------- starting and moving a scene
+// ---------------------------------------------------------------- starting and moving a sky
 static int sceneDropCount(int kind) { return kind == 6 ? SCENE_DROPS : (kind == 4 ? 105 : (kind == 5 ? 80 : 0)); }
 static const int SCENE_RAIN_TOP = 44;      // rain and snow appear from under the clouds
 
-static void sceneStart(SceneState& st, int kind, bool night) {
-  st.kind = kind;
-  st.night = night;
+static void sceneStart(SceneState& st, const SceneInfo& info) {
+  st.kind = info.kind;
+  st.phase = info.phase;
+  st.plain = info.plain;
   st.frame = 0;
   st.flash = 0; st.boltFrames = 0; st.nextBolt = 20;
   for (int i = 0; i < SCENE_CLOUDS; ++i) st.cloudX[i] = (float)(i * 78) - 60.0f + (float)sceneRandom(st, 40);
   for (int i = 0; i < SCENE_DROPS; ++i) {
     st.dropX[i] = (int16_t)sceneRandom(st, SCENE_W + 60);
     st.dropY[i] = (int16_t)(SCENE_RAIN_TOP + sceneRandom(st, SCENE_H - SCENE_RAIN_TOP));
-    st.dropSpeed[i] = (uint8_t)(kind == 5 ? 1 + sceneRandom(st, 2) : 8 + sceneRandom(st, 5));
+    st.dropSpeed[i] = (uint8_t)(info.kind == 5 ? 1 + sceneRandom(st, 2) : 8 + sceneRandom(st, 5));
   }
-  sceneColors(kind, night);
+  sceneColors(info);
 }
 
 static void sceneStep(SceneState& st) {
@@ -176,7 +196,7 @@ static void sceneStep(SceneState& st) {
   }
 }
 
-// ---------------------------------------------------------------- drawing one frame
+// ---------------------------------------------------------------- drawing the sky
 // A puffy cloud, 22 x 12 cells. u = pixels per cell.
 static void sceneCloud(LGFX_Sprite& s, int x, int y, int u) {
   s.fillRoundRect(x + u, y + 6 * u, 20 * u, 6 * u, 3 * u, SC_CLOUD_SHADE);       // the shaded underside
@@ -191,14 +211,20 @@ static void sceneShadowText(LGFX_Sprite& s, const char* text, int x, int y, int 
   s.setTextColor(color);     s.drawString(text, x, y);
 }
 
-// words = false draws the sky alone. show = false draws it without copying it to the screen.
-static void sceneDraw(SceneState& st, const SceneInfo& info, bool words = true, bool show = true) {
+// Draws the sky and everything in it into the picture (not yet onto the screen).
+// advance = true also moves the clouds, rain and so on by one step.
+static void sceneRender(const SceneInfo& info, bool advance) {
+  SceneState& st = sky;
+  if (st.kind != info.kind || st.phase != info.phase || st.plain != info.plain) sceneStart(st, info);
+  else if (advance) sceneStep(st);
+
   LGFX_Sprite& s = *sceneSprite;
   int kind = st.kind;
-  bool darkSky = st.night && kind <= 2;
+  bool night = st.phase == PHASE_NIGHT;
+  bool starry = (night && kind <= 2) || st.plain;
 
   // sky: three bands with a dotted edge between them
-  if (kind == 6) {
+  if (kind == 6 && !st.plain) {
     if (st.flash > 0) sceneSetSky(0x8F8AB8, 0xA29DC6, 0xB7B3D6);
     else              sceneSetSky(sceneSky[0], sceneSky[1], sceneSky[2]);
   }
@@ -211,7 +237,7 @@ static void sceneDraw(SceneState& st, const SceneInfo& info, bool words = true, 
     s.fillRect(x + 4, b2, 4, 2, SC_SKY_MID);
   }
 
-  if (darkSky) {                                            // stars that blink
+  if (starry) {                                             // stars that blink
     uint32_t r = 777;
     for (int i = 0; i < SCENE_STARS; ++i) {
       r = r * 1664525u + 1013904223u; int x = (r >> 8) % SCENE_W;
@@ -220,20 +246,21 @@ static void sceneDraw(SceneState& st, const SceneInfo& info, bool words = true, 
     }
   }
 
-  if (kind <= 1) {                                          // sun, or the moon at night
-    int cx = 250, cy = 62;
-    if (st.night) {
-      s.fillCircle(cx, cy, 24, SC_SUN);
-      s.fillCircle(cx + 11, cy - 8, 20, SC_SKY_TOP);
+  if (kind <= 1 && !st.plain) {                             // sun, or the moon at night
+    int cx = info.sunX, cy = info.sunY, r = info.sunR;
+    if (night) {
+      s.fillCircle(cx, cy, r * 4 / 5, SC_SUN);
+      s.fillCircle(cx + r * 11 / 30, cy - r * 8 / 30, r * 2 / 3, SC_SKY_TOP);
     } else {
       float a0 = st.frame * 0.03f;
-      int reach = 43 + ((st.frame / 8) % 2) * 2;
+      int reach = r * 43 / 30 + ((st.frame / 8) % 2) * 2;
+      int box = r * 9 / 30 < 5 ? 5 : r * 9 / 30;
       for (int i = 0; i < 8; ++i) {
         float a = a0 + i * 0.7853982f;
         int rx = cx + (int)lroundf(cosf(a) * reach), ry = cy + (int)lroundf(sinf(a) * reach);
-        s.fillRect(rx - 4, ry - 4, 9, 9, SC_RAY);
+        s.fillRect(rx - box / 2, ry - box / 2, box, box, SC_RAY);
       }
-      s.fillCircle(cx, cy, 30, SC_SUN);
+      s.fillCircle(cx, cy, r, SC_SUN);
     }
   }
 
@@ -246,7 +273,7 @@ static void sceneDraw(SceneState& st, const SceneInfo& info, bool words = true, 
     }
   }
 
-  // Clouds stay in the top part of the sky, clear of the big temperature.
+  // Clouds stay in the top part of the sky, clear of the big numbers.
   if (kind == 1) {                                          // a few clouds
     sceneCloud(s, (int)st.cloudX[0], 50, 3);
     sceneCloud(s, (int)st.cloudX[2] + 40, 18, 3);
@@ -279,52 +306,94 @@ static void sceneDraw(SceneState& st, const SceneInfo& info, bool words = true, 
       for (int t = -1; t <= 1; ++t)
         s.drawLine(st.boltX[i] + t, st.boltY[i], st.boltX[i + 1] + t, st.boltY[i + 1], SC_BOLT);
   }
+}
 
-  if (!words) { if (show) s.pushSprite(0, 0); return; }
+// Copies the finished picture to the screen.
+static void sceneShow() { sceneSprite->pushSprite(0, 0); }
 
-  // the words and numbers, each with a dark edge so they read on any sky
-  s.fillRect(SCENE_W / 2 - 22, 1, 44, 3, SC_TEXT_SOFT);                    // the menu grab bar
+// ---------------------------------------------------------------- words on top of the sky
+// Each has a dark edge so it reads on any sky.
+static void sceneGrabBar() { sceneSprite->fillRect(SCENE_W / 2 - 22, 1, 44, 3, SC_TEXT_SOFT); }
+
+// Weather: city, big temperature, conditions, high and low.
+static void sceneWeatherWords(const char* city, const char* temp, const char* unit, const char* cond, const char* hi, const char* lo) {
+  LGFX_Sprite& s = *sceneSprite;
+  sceneGrabBar();
   s.setTextDatum(lgfx::textdatum_t::top_left);
   s.setFont(FONT_SMALL);
-  sceneShadowText(s, info.city, 10, 12, SC_TEXT);
+  sceneShadowText(s, city, 10, 12, SC_TEXT);
 
   s.setFont(&fonts::Font7);
   s.setTextSize(2);
   int tx = 12, ty = 92;
-  sceneShadowText(s, info.temp, tx, ty, SC_TEXT, 3);
-  int ux = tx + s.textWidth(info.temp) + 12;
+  sceneShadowText(s, temp, tx, ty, SC_TEXT, 3);
+  int ux = tx + s.textWidth(temp) + 12;
   s.setTextSize(1);
   for (int r = 5; r <= 8; ++r) s.drawCircle(ux + 2, ty + 10, r, SC_SHADOW);
   for (int r = 5; r <= 8; ++r) s.drawCircle(ux, ty + 8, r, SC_TEXT);
   s.setFont(FONT_BIG);
-  sceneShadowText(s, info.unit, ux + 12, ty + 2, SC_TEXT, 2);
+  sceneShadowText(s, unit, ux + 12, ty + 2, SC_TEXT, 2);
 
   s.setFont(FONT_BIG);
-  sceneShadowText(s, info.cond, 12, 196, SC_TEXT, 2);
+  sceneShadowText(s, cond, 12, 196, SC_TEXT, 2);
   char hl[32];
-  snprintf(hl, sizeof hl, "H %s   L %s", info.hi, info.lo);
+  snprintf(hl, sizeof hl, "H %s   L %s", hi, lo);
   s.setFont(FONT_BODY);
   s.setTextDatum(lgfx::textdatum_t::top_right);
   sceneShadowText(s, hl, SCENE_W - 10, 172, SC_TEXT_SOFT);
-
-  // hint: swipe up for the details
   s.setFont(FONT_SMALL);
   sceneShadowText(s, "SWIPE UP FOR DETAILS", SCENE_W - 10, 226, SC_TEXT_SOFT);
   s.setTextDatum(lgfx::textdatum_t::top_left);
+}
 
-  if (show) s.pushSprite(0, 0);
+// Clock: the big time, AM or PM and the seconds beside it, the date underneath.
+static void sceneClockWords(const char* time, const char* ampm, const char* seconds, const char* date) {
+  LGFX_Sprite& s = *sceneSprite;
+  sceneGrabBar();
+  s.setTextDatum(lgfx::textdatum_t::top_left);
+  s.setFont(&fonts::Font7);
+  s.setTextSize(2);
+  int tw = s.textWidth(time);
+  s.setTextSize(1);
+  s.setFont(FONT_BIG);
+  int side = s.textWidth(ampm && ampm[0] ? ampm : "00") + 10;
+  int lead = time[0] == '1' ? 40 : 0;       // a leading 1 is drawn at the right of its space; skip the empty part
+  int x = (SCENE_W - (tw - lead) - side) / 2 - lead, y = 96;
+  if (x < 4 - lead) x = 4 - lead;
+
+  s.setFont(&fonts::Font7);
+  s.setTextSize(2);
+  sceneShadowText(s, time, x, y, SC_TEXT, 3);
+  s.setTextSize(1);
+  s.setFont(FONT_BIG);
+  if (ampm && ampm[0]) sceneShadowText(s, ampm, x + tw + 10, y + 70, SC_TEXT, 2);
+  s.setFont(FONT_BODY);
+  sceneShadowText(s, seconds, x + tw + 12, y + 46, SC_TEXT_SOFT);
+
+  s.setFont(FONT_BIG);
+  s.setTextDatum(lgfx::textdatum_t::top_center);
+  sceneShadowText(s, date, SCENE_W / 2, 204, SC_TEXT, 2);
+  s.setTextDatum(lgfx::textdatum_t::top_left);
+}
+
+// Screensaver: a small clock and date wherever the caller puts them.
+static const int SAVER_BOX_W = 150, SAVER_BOX_H = 74;
+static void sceneSaverWords(const char* time, const char* date, int x, int y) {
+  LGFX_Sprite& s = *sceneSprite;
+  s.setTextDatum(lgfx::textdatum_t::top_left);
+  s.setFont(&fonts::Font7);
+  sceneShadowText(s, time, x, y, SC_TEXT, 2);
+  s.setFont(FONT_SMALL);
+  sceneShadowText(s, date, x + 2, y + 58, SC_TEXT_SOFT);
 }
 
 // ---------------------------------------------------------------- the blurred sky
 // Paints the current sky onto the screen out of focus and darkened, so text can sit on top.
-// It shrinks the picture to a quarter size, softens that, and stretches it back smoothly.
 // keepPercent: how much brightness to keep (40 = fairly dark). Returns false if memory ran out.
-static bool sceneBlurToScreen(lgfx::LovyanGFX* screen, int keepPercent) {
+static bool sceneBlurToScreen(int keepPercent) {
   static const int SW = SCENE_W / 4, SH = SCENE_H / 4;
   uint8_t* buf = (uint8_t*)malloc((size_t)SW * SH * 3 * 2);
   if (!buf) return false;
-  uint8_t* a = buf;
-  uint8_t* b = buf + SW * SH * 3;
 
   // shrink: each small pixel is the average of four samples from its 4 x 4 block
   for (int y = 0; y < SH; ++y) {
@@ -334,55 +403,12 @@ static bool sceneBlurToScreen(lgfx::LovyanGFX* screen, int keepPercent) {
         uint32_t c = scenePalette[sceneSprite->readPixelValue(x * 4 + (k & 1) * 2 + 1, y * 4 + (k >> 1) * 2 + 1) & 15];
         r += (c >> 16) & 255; g += (c >> 8) & 255; bl += c & 255;
       }
-      uint8_t* p = a + (y * SW + x) * 3;
+      uint8_t* p = buf + (y * SW + x) * 3;
       p[0] = (uint8_t)(r / 4); p[1] = (uint8_t)(g / 4); p[2] = (uint8_t)(bl / 4);
     }
   }
-
-  // soften: a small blur sideways then up-and-down, done three times
-  for (int pass = 0; pass < 3; ++pass) {
-    for (int y = 0; y < SH; ++y)
-      for (int x = 0; x < SW; ++x) {
-        int xl = x > 0 ? x - 1 : x, xr = x < SW - 1 ? x + 1 : x;
-        const uint8_t* l = a + (y * SW + xl) * 3; const uint8_t* m = a + (y * SW + x) * 3; const uint8_t* r = a + (y * SW + xr) * 3;
-        uint8_t* o = b + (y * SW + x) * 3;
-        for (int c = 0; c < 3; ++c) o[c] = (uint8_t)((l[c] + 2 * m[c] + r[c]) / 4);
-      }
-    for (int y = 0; y < SH; ++y) {
-      int yu = y > 0 ? y - 1 : y, yd = y < SH - 1 ? y + 1 : y;
-      for (int x = 0; x < SW; ++x) {
-        const uint8_t* u = b + (yu * SW + x) * 3; const uint8_t* m = b + (y * SW + x) * 3; const uint8_t* d = b + (yd * SW + x) * 3;
-        uint8_t* o = a + (y * SW + x) * 3;
-        for (int c = 0; c < 3; ++c) o[c] = (uint8_t)((u[c] + 2 * m[c] + d[c]) / 4);
-      }
-    }
-  }
-
-  // stretch back to full size, blending between neighbors, one screen row at a time
-  static uint8_t row[SCENE_W * 2];
-  int keep = keepPercent * 256 / 100;
-  screen->startWrite();
-  for (int y = SCENE_H - 1; y >= 0; --y) {                  // bottom row first, so it rises into view
-    int v = y * (SH - 1) * 256 / (SCENE_H - 1);
-    int y0 = v >> 8, wy = v & 255, y1 = y0 < SH - 1 ? y0 + 1 : y0;
-    for (int x = 0; x < SCENE_W; ++x) {
-      int u = x * (SW - 1) * 256 / (SCENE_W - 1);
-      int x0 = u >> 8, wx = u & 255, x1 = x0 < SW - 1 ? x0 + 1 : x0;
-      const uint8_t* p00 = a + (y0 * SW + x0) * 3; const uint8_t* p01 = a + (y0 * SW + x1) * 3;
-      const uint8_t* p10 = a + (y1 * SW + x0) * 3; const uint8_t* p11 = a + (y1 * SW + x1) * 3;
-      int rgb[3];
-      for (int c = 0; c < 3; ++c) {
-        int top = p00[c] * (256 - wx) + p01[c] * wx;
-        int bot = p10[c] * (256 - wx) + p11[c] * wx;
-        rgb[c] = (((top * (256 - wy) + bot * wy) >> 16) * keep) >> 8;
-      }
-      uint16_t px = (uint16_t)(((rgb[0] & 0xF8) << 8) | ((rgb[1] & 0xFC) << 3) | (rgb[2] >> 3));
-      row[x * 2] = (uint8_t)(px >> 8);
-      row[x * 2 + 1] = (uint8_t)(px & 0xFF);
-    }
-    screen->pushImage(0, y, SCENE_W, 1, reinterpret_cast<const lgfx::swap565_t*>(row));
-  }
-  screen->endWrite();
+  softenSmall(buf, buf + SW * SH * 3, SW, SH, 3);
+  stretchToScreen(buf, SW, SH, 0, 0, SCENE_W, SCENE_H, keepPercent, true);   // bottom row first, so it rises into view
   free(buf);
   return true;
 }

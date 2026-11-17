@@ -253,6 +253,67 @@ static void drawPullHandle(uint32_t col = pal.dim) {
   gfx->fillRect(SCREEN_W / 2 - 22, 1, 44, 3, col);
 }
 
+// ---------------------------------------------------------------- blurred pictures
+// A blur is made by shrinking a picture to a few dozen pixels across, softening that, and
+// stretching it back over the screen while blending between its pixels.
+
+// Softens a small RGB picture (3 bytes per pixel) in place. 'scratch' is spare room of the same size.
+static void softenSmall(uint8_t* a, uint8_t* scratch, int w, int h, int passes) {
+  uint8_t* b = scratch;
+  for (int pass = 0; pass < passes; ++pass) {
+    for (int y = 0; y < h; ++y)
+      for (int x = 0; x < w; ++x) {
+        int xl = x > 0 ? x - 1 : x, xr = x < w - 1 ? x + 1 : x;
+        const uint8_t* l = a + (y * w + xl) * 3; const uint8_t* m = a + (y * w + x) * 3; const uint8_t* r = a + (y * w + xr) * 3;
+        uint8_t* o = b + (y * w + x) * 3;
+        for (int c = 0; c < 3; ++c) o[c] = (uint8_t)((l[c] + 2 * m[c] + r[c]) / 4);
+      }
+    for (int y = 0; y < h; ++y) {
+      int yu = y > 0 ? y - 1 : y, yd = y < h - 1 ? y + 1 : y;
+      for (int x = 0; x < w; ++x) {
+        const uint8_t* u = b + (yu * w + x) * 3; const uint8_t* m = b + (y * w + x) * 3; const uint8_t* d = b + (yd * w + x) * 3;
+        uint8_t* o = a + (y * w + x) * 3;
+        for (int c = 0; c < 3; ++c) o[c] = (uint8_t)((u[c] + 2 * m[c] + d[c]) / 4);
+      }
+    }
+  }
+}
+
+// Paints the rectangle (x, y, rw, rh) of the screen from a small RGB picture that is imagined
+// stretched over the whole screen. keepPercent darkens it (100 = as is, 40 = fairly dark).
+static void stretchToScreen(const uint8_t* img, int w, int h, int x, int y, int rw, int rh, int keepPercent, bool bottomUp = false) {
+  static uint8_t row[SCREEN_W * 2];
+  if (x < 0) { rw += x; x = 0; }
+  if (y < 0) { rh += y; y = 0; }
+  if (x + rw > SCREEN_W) rw = SCREEN_W - x;
+  if (y + rh > SCREEN_H) rh = SCREEN_H - y;
+  if (rw <= 0 || rh <= 0) return;
+  int keep = keepPercent * 256 / 100;
+  gfx->startWrite();
+  for (int i = 0; i < rh; ++i) {
+    int sy = bottomUp ? y + rh - 1 - i : y + i;
+    int v = sy * (h - 1) * 256 / (SCREEN_H - 1);
+    int y0 = v >> 8, wy = v & 255, y1 = y0 < h - 1 ? y0 + 1 : y0;
+    for (int j = 0; j < rw; ++j) {
+      int u = (x + j) * (w - 1) * 256 / (SCREEN_W - 1);
+      int x0 = u >> 8, wx = u & 255, x1 = x0 < w - 1 ? x0 + 1 : x0;
+      const uint8_t* p00 = img + (y0 * w + x0) * 3; const uint8_t* p01 = img + (y0 * w + x1) * 3;
+      const uint8_t* p10 = img + (y1 * w + x0) * 3; const uint8_t* p11 = img + (y1 * w + x1) * 3;
+      int rgb[3];
+      for (int c = 0; c < 3; ++c) {
+        int top = p00[c] * (256 - wx) + p01[c] * wx;
+        int bot = p10[c] * (256 - wx) + p11[c] * wx;
+        rgb[c] = (((top * (256 - wy) + bot * wy) >> 16) * keep) >> 8;
+      }
+      uint16_t px = (uint16_t)(((rgb[0] & 0xF8) << 8) | ((rgb[1] & 0xFC) << 3) | (rgb[2] >> 3));
+      row[j * 2] = (uint8_t)(px >> 8);
+      row[j * 2 + 1] = (uint8_t)(px & 0xFF);
+    }
+    gfx->pushImage(x, sy, rw, 1, reinterpret_cast<const lgfx::swap565_t*>(row));
+  }
+  gfx->endWrite();
+}
+
 // ---------------------------------------------------------------- full-screen messages
 static void drawMessageScreen(const char* big, const char* line1, const char* line2, const char* hint = nullptr) {
   gfx->startWrite();
@@ -417,4 +478,124 @@ static void drawPlayingScreen(const UiState& s) {
   drawTrackText(s);
   drawBar(s);
   drawButtons(s);
+}
+
+// ---------------------------------------------------------------- full-screen cover view
+// The cover sits in the middle over a blurred, darkened copy of itself that fills the screen,
+// with the title, the artist and the visualizer bars below. Used in the Full color look.
+static const int AB_W = 40, AB_H = 30;                 // size of the small blurred copy
+static uint8_t artBlur[AB_W * AB_H * 3];
+static bool    artBackdropBlurred = true;              // false: plain background (Minimal look)
+static const int ARTV_KEEP = 50;                       // how much of the blurred cover's brightness to keep
+
+static const int ARTV_X = (SCREEN_W - ART_SIZE) / 2, ARTV_Y = 10;
+static const int ARTV_TEXT_Y = 156, ARTV_TEXT_H = 42;
+static const int VIZ_BARS = 16, VIZ_X = 9, VIZ_PITCH = 19, VIZ_BAR_W = 16, VIZ_BOTTOM = SCREEN_H - 1, VIZ_H = 38;
+
+// Builds the small blurred copy from the middle of the cover.
+static void buildArtBlur(const uint8_t* art) {
+  static uint8_t scratch[AB_W * AB_H * 3];
+  int top = (ART_SIZE - ART_SIZE * AB_H / AB_W) / 2;     // crop the square cover to the screen's shape
+  for (int y = 0; y < AB_H; ++y) {
+    for (int x = 0; x < AB_W; ++x) {
+      int r = 0, g = 0, b = 0;
+      for (int k = 0; k < 4; ++k) {
+        int sx = (x * 2 + (k & 1)) * ART_SIZE / (AB_W * 2) + 1;
+        int sy = top + (y * 2 + (k >> 1)) * (ART_SIZE - 2 * top) / (AB_H * 2) + 1;
+        if (sx >= ART_SIZE) sx = ART_SIZE - 1;
+        if (sy >= ART_SIZE) sy = ART_SIZE - 1;
+        const uint8_t* p = art + ((size_t)sy * ART_SIZE + sx) * 2;
+        uint16_t v = ((uint16_t)p[0] << 8) | p[1];
+        r += ((v >> 11) & 31) * 255 / 31; g += ((v >> 5) & 63) * 255 / 63; b += (v & 31) * 255 / 31;
+      }
+      uint8_t* o = artBlur + (y * AB_W + x) * 3;
+      o[0] = (uint8_t)(r / 4); o[1] = (uint8_t)(g / 4); o[2] = (uint8_t)(b / 4);
+    }
+  }
+  softenSmall(artBlur, scratch, AB_W, AB_H, 3);
+}
+
+// Repaints part of the backdrop (to erase whatever was drawn over it).
+static void artBackdrop(int x, int y, int w, int h) {
+  if (artBackdropBlurred) stretchToScreen(artBlur, AB_W, AB_H, x, y, w, h, ARTV_KEEP);
+  else gfx->fillRect(x, y, w, h, musicPal.bg);
+}
+
+static void drawArtViewText(const UiState& s) {
+  artBackdrop(0, ARTV_TEXT_Y, SCREEN_W, ARTV_TEXT_H);
+  gfx->startWrite();
+  gfx->setTextDatum(lgfx::textdatum_t::top_center);
+  gfx->setFont(FONT_TITLE);
+  gfx->setTextColor(0xFFFFFFu);
+  drawWrapped(s.title[0] ? s.title : "Unknown track", SCREEN_W / 2, ARTV_TEXT_Y + 2, SCREEN_W - 24, 1, TITLE_LINE_H);
+  gfx->setFont(FONT_BODY);
+  gfx->setTextColor(artBackdropBlurred ? 0xD6DEE8u : musicPal.accent);
+  if (s.artist[0]) drawWrapped(s.artist, SCREEN_W / 2, ARTV_TEXT_Y + 24, SCREEN_W - 24, 1, BODY_LINE_H);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->endWrite();
+}
+
+static void drawArtViewCover(const UiState& s, int x, int y) {
+  if (s.artValid && s.art) gfx->pushImage(x, y, ART_SIZE, ART_SIZE, reinterpret_cast<const lgfx::swap565_t*>(s.art));
+  else gfx->fillRect(x, y, ART_SIZE, ART_SIZE, 0x14161Au);       // the cover has not arrived yet
+}
+
+static void drawArtView(const UiState& s) {
+  artBackdrop(0, 0, SCREEN_W, SCREEN_H);
+  gfx->fillRect(SCREEN_W / 2 - 22, 1, 44, 3, 0xD6DEE8u);
+  gfx->drawRect(ARTV_X - 1, ARTV_Y - 1, ART_SIZE + 2, ART_SIZE + 2, 0xFFFFFFu);
+  drawArtViewCover(s, ARTV_X, ARTV_Y);
+  drawArtViewText(s);
+}
+
+// ---- visualizer: bars along the bottom that follow the sound levels the computer sends
+struct VizState {
+  uint8_t  target[VIZ_BARS] = { 0 };     // latest levels from the computer, 0..255
+  float    level[VIZ_BARS]  = { 0 };     // what the bars are easing toward, in pixels
+  int16_t  shown[VIZ_BARS];              // height currently on screen, -1 = nothing drawn yet
+  uint32_t lastDataMs = 0;
+};
+
+static void vizReset(VizState& v) {
+  for (int i = 0; i < VIZ_BARS; ++i) { v.level[i] = 0; v.shown[i] = -1; }
+}
+
+// Moves the bars one step and repaints only the parts that changed.
+static void drawVizBars(VizState& v, bool live) {
+  gfx->startWrite();
+  for (int i = 0; i < VIZ_BARS; ++i) {
+    float want = live ? v.target[i] * VIZ_H / 255.0f : 0.0f;
+    if (want > v.level[i]) v.level[i] = want;                       // jump up with the sound
+    else v.level[i] -= (v.level[i] - want) * 0.28f + 0.4f;          // sink back down
+    if (v.level[i] < 0) v.level[i] = 0;
+    int h = (int)(v.level[i] + 0.5f);
+    if (h < 2) h = 2;                                               // a thin resting line
+    int old = v.shown[i];
+    if (h == old) continue;
+    int x = VIZ_X + i * VIZ_PITCH;
+    if (old < 0) { artBackdrop(x, VIZ_BOTTOM - VIZ_H, VIZ_BAR_W, VIZ_H + 1); old = 0; }
+    if (h > old) gfx->fillRect(x, VIZ_BOTTOM - h + 1, VIZ_BAR_W, h - old, musicPal.accent);
+    else         artBackdrop(x, VIZ_BOTTOM - old + 1, VIZ_BAR_W, old - h);
+    v.shown[i] = (int16_t)h;
+  }
+  gfx->endWrite();
+}
+
+// ---- screensaver while music plays: the cover drifts around the screen
+struct FloatState { int x = ARTV_X, y = 50, dx = 1, dy = 1; };
+
+static void drawFloatStart(const UiState& s, FloatState& f) {
+  artBackdrop(0, 0, SCREEN_W, SCREEN_H);
+  drawArtViewCover(s, f.x, f.y);
+}
+
+static void drawFloatStep(const UiState& s, FloatState& f) {
+  int nx = f.x + f.dx, ny = f.y + f.dy;
+  if (nx < 0 || nx + ART_SIZE > SCREEN_W) { f.dx = -f.dx; nx = f.x + f.dx; }
+  if (ny < 0 || ny + ART_SIZE > SCREEN_H) { f.dy = -f.dy; ny = f.y + f.dy; }
+  // erase the thin edges the cover is leaving behind
+  if (nx > f.x) artBackdrop(f.x, f.y, nx - f.x, ART_SIZE); else if (nx < f.x) artBackdrop(nx + ART_SIZE, f.y, f.x - nx, ART_SIZE);
+  if (ny > f.y) artBackdrop(f.x, f.y, ART_SIZE, ny - f.y); else if (ny < f.y) artBackdrop(f.x, ny + ART_SIZE, ART_SIZE, f.y - ny);
+  f.x = nx; f.y = ny;
+  drawArtViewCover(s, f.x, f.y);
 }

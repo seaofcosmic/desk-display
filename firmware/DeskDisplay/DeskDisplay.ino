@@ -162,14 +162,41 @@ static Stats        stats;
 static Settings     settings;
 static int          setPage = 0;
 
+static bool         artView = false;          // music: the full-screen cover is showing instead of the controls
+static VizState     viz;                      // music: the visualizer bars
+static uint32_t     lastMetaMs = 0;           // when the current track was announced
+static uint32_t     lastTouchMs = 0;          // when the screen was last touched
+static bool         saverOn = false;          // the screensaver is showing
+static bool         saverFloat = false;       // ...as the floating cover (otherwise the sky)
+static bool         saverRedraw = false;
+static SaverState   saver;
+static FloatState   floater;
+
 static const uint32_t LINK_TIMEOUT_MS = 5000;
+
+// How long the screen is left alone before the music controls turn into the full-screen cover,
+// and how long one "minute" of the screensaver setting is. (The test harness shortens both.)
+#ifndef ART_IDLE_MS
+#define ART_IDLE_MS 12000
+#endif
+#ifndef SAVER_MINUTE_MS
+#define SAVER_MINUTE_MS 60000
+#endif
 
 static bool before(uint32_t now, uint32_t deadline) { return (int32_t)(now - deadline) < 0; }
 
 static View musicView()           { return !linkUp ? VIEW_NOLINK : (hasTrack ? VIEW_PLAYING : VIEW_STANDBY); }
-static bool appVisible(App a)     { return !menuOpen && !alertOpen && app == a; }
+static bool appVisible(App a)     { return !menuOpen && !alertOpen && !saverOn && app == a; }
 static bool playingVisible()      { return appVisible(APP_MUSIC) && musicView() == VIEW_PLAYING; }
+static bool controlsVisible()     { return playingVisible() && !artView; }   // the cover, text, gauge and buttons
+static bool artViewVisible()      { return playingVisible() && artView; }
 static uint32_t clockNow(uint32_t now) { return clockSyncEpoch + (now - clockSyncAtMs) / 1000; }
+
+// The clock, set to this moment.
+static const ClockState& clockAt(uint32_t now) {
+  if (clockState.known) clockState.epoch = clockNow(now);
+  return clockState;
+}
 
 static uint32_t currentPosMs(uint32_t now) {
   if (scrubbing) return scrubMs;
@@ -204,7 +231,7 @@ static Palette paletteFor(App a) {
     case APP_WEATHER: {
       if (!weather.valid) return appPalette(a);
       float hue, sat;
-      sceneHue(weather.icon, weather.night, hue, sat);
+      sceneHue(weather.icon, skyPhase(weather, clockAt(millis())), hue, sat);
       return paletteFromHS(hue, sat);
     }
     default:          return appPalette(a);
@@ -214,6 +241,7 @@ static Palette paletteFor(App a) {
 // Picks the music screen's colors: from the album cover in the Full color look (if album
 // colors are on), otherwise the amber theme. Returns true if the colors changed.
 static bool refreshMusicPalette() {
+  artBackdropBlurred = settings.fullColor;
   Palette p = (settings.fullColor && settings.albumColors && ui.artValid) ? paletteFromArt(artBuf) : SYSTEM_PALETTE;
   if (p == musicPal) return false;
   musicPal = p;
@@ -249,18 +277,20 @@ static void showCurrent() {
   ui.pressed = ZONE_NONE;
   applyBrightness();
 
-  if (alertOpen) { pal = SYSTEM_PALETTE; drawAlert(alert); return; }
+  if (alertOpen) { saverOn = false; pal = SYSTEM_PALETTE; drawAlert(alert); return; }
+  if (saverOn)   { saverRedraw = true; return; }      // the screensaver paints itself, in loop()
   if (menuOpen)  { pal = settings.fullColor ? menuPalette() : SYSTEM_PALETTE; drawMenu(app); return; }
   pal = paletteFor(app);
 
   switch (app) {
     case APP_CLOCK:
       clockState.epoch = clockShownEpoch = clockNow(now);
-      drawClockScreen(clockState);
+      if (clockImmersive(clockState)) drawClockSky(clockState, weather, false);
+      else drawClockScreen(clockState);
       break;
     case APP_WEATHER:
-      if (weatherImmersive(weather) && weatherDetails) drawWeatherDetails(weather);
-      else drawWeatherScreen(weather);
+      if (weatherImmersive(weather) && weatherDetails) drawWeatherDetails(weather, clockAt(now));
+      else drawWeatherScreen(weather, clockAt(now));
       break;
     case APP_REMINDERS:
       if (remPage >= reminderPages(reminders)) remPage = 0;
@@ -280,7 +310,10 @@ static void showCurrent() {
     default:
       if (musicView() == VIEW_NOLINK)       drawNoLink();
       else if (musicView() == VIEW_STANDBY) drawStandby();
-      else {
+      else if (artView) {
+        drawArtView(ui);
+        vizReset(viz);
+      } else {
         ui.posMs = currentPosMs(now);
         drawPlayingScreen(ui);
         barDirty = false;
@@ -303,14 +336,15 @@ static void handleFrame() {
   if (!parser->ok()) {
     if (type == 'A') {                       // damaged picture: drop it and ask again
       ui.artValid = false;
-      if (playingVisible()) drawArt(ui);
+      if (controlsVisible()) drawArt(ui);
       Serial.print("DT:NAK:A\n");
     }
     return;
   }
 
   View viewBefore = musicView();
-  bool partial = playingVisible();           // the now-playing screen is up: update just the changed part
+  bool partial = controlsVisible();          // the music controls are up: update just the changed part
+  bool coverUp = artViewVisible();           // the full-screen cover is up
   lastFrameMs = now;
   linkUp = true;
   const char* text = (const char*)parser->payload();
@@ -329,7 +363,11 @@ static void handleFrame() {
       hasTrack = true;
       syncPosMs = 0; syncAtMs = now; seekHoldUntil = 0;
       scrubbing = false;
+      lastMetaMs = now;
+      memset(artBlur, 0x1C, sizeof artBlur);   // a plain dark backdrop until the new cover arrives
       if (partial) { drawArt(ui); drawTrackText(ui); barDirty = true; }
+      if (coverUp) showCurrent();
+      if (saverOn && saverFloat) saverRedraw = true;
       break;
 
     case 'S': {
@@ -362,11 +400,22 @@ static void handleFrame() {
 
     case 'A':
       ui.artValid = true;
-      if (refreshMusicPalette()) { if (partial) showCurrent(); }   // new album colors: repaint it all
+      buildArtBlur(artBuf);
+      if (coverUp) { refreshMusicPalette(); showCurrent(); }
+      else if (refreshMusicPalette()) { if (partial) showCurrent(); }   // new album colors: repaint it all
       else if (partial) drawArt(ui);
+      if (saverOn && saverFloat) saverRedraw = true;
+      break;
+
+    case 'V':                                  // sound levels for the visualizer
+      if (parser->length() >= (uint32_t)VIZ_BARS) {
+        memcpy(viz.target, parser->payload(), VIZ_BARS);
+        viz.lastDataMs = now;
+      }
       break;
 
     case 'X':
+      artView = false;
       hasTrack = false;
       ui.artValid = false;
       ui.title[0] = ui.artist[0] = ui.album[0] = 0;
@@ -436,6 +485,7 @@ static int  startX = 0, startY = 0;
 static int  trailX[3] = { 0, 0, 0 }, trailY[3] = { 0, 0, 0 };
 static int  trailLen = 0;
 static int  pressedTile = -1;
+static bool swallowTouch = false;    // this touch only woke the screensaver
 
 static const int SWIPE_MIN = 45;     // pixels a finger must travel to count as a swipe
 static const int TAP_MAX   = 18;     // pixels a finger may wander and still count as a tap
@@ -446,16 +496,16 @@ static void changeSetting(int i) {
   saveSettings();
   drawSettingsRow(settings, setPage, i);
   switch (i) {
-    case 0:                                   // the look changed: repaint in the new colors
+    case SET_LOOK:                            // the look changed: repaint in the new colors
       fullColorMode = settings.fullColor;
       weatherDetails = false;
       refreshMusicPalette();
       showCurrent();
       break;
-    case 1: refreshMusicPalette(); break;
-    case 2: clockState.h24 = settings.h24; sendSettings(); break;
-    case 3: case 4: case 5: sendSettings(); break;
-    case 7: applyBrightness(); break;
+    case SET_ALBUM_COLORS: refreshMusicPalette(); break;
+    case SET_TIME: clockState.h24 = settings.h24; sendSettings(); break;
+    case SET_WEATHER_UNIT: case SET_REMINDER_ALERTS: case SET_EVENT_ALERTS: sendSettings(); break;
+    case SET_BRIGHTNESS: applyBrightness(); break;
   }
 }
 
@@ -471,7 +521,11 @@ static void onTap(int x, int y) {
     }
     return;
   }
-  if (app == APP_REMINDERS && reminders.valid) {
+  if (app == APP_MUSIC && musicView() == VIEW_PLAYING) {
+    // Tapping the cover makes it fill the screen; tapping the full-screen cover brings the controls back.
+    if (artView) { artView = false; showCurrent(); }
+    else if (x < ART_X + ART_SIZE + 4 && y < BAR_AREA_Y - 6) { artView = true; showCurrent(); }
+  } else if (app == APP_REMINDERS && reminders.valid) {
     int i = reminderAt(reminders, remPage, y);
     if (i == -2) {
       int pages = reminderPages(reminders);
@@ -498,6 +552,12 @@ static void onPress(int x, int y) {
   trailX[0] = x; trailY[0] = y; trailLen = 1;
   pressedTile = -1;
   gesture = true;
+  if (saverOn) {                              // the first touch only wakes the screen
+    saverOn = false;
+    swallowTouch = true;
+    showCurrent();
+    return;
+  }
   if (alertOpen) return;
 
   if (menuOpen) {
@@ -505,7 +565,7 @@ static void onPress(int x, int y) {
     if (pressedTile >= 0) drawMenuTile(pressedTile, pressedTile == app, true);
     return;
   }
-  if (!playingVisible()) return;
+  if (!controlsVisible()) return;
 
   Zone z = zoneAt(x, y);
   if (z == ZONE_NONE) return;
@@ -535,6 +595,7 @@ static void onPress(int x, int y) {
 }
 
 static void onDrag(int x, int y) {
+  if (swallowTouch) return;
   if (trailLen < 3) { trailX[trailLen] = x; trailY[trailLen] = y; ++trailLen; }
   else { trailX[0] = trailX[1]; trailY[0] = trailY[1]; trailX[1] = trailX[2]; trailY[1] = trailY[2]; trailX[2] = x; trailY[2] = y; }
 
@@ -550,6 +611,7 @@ static void onDrag(int x, int y) {
 
 static void onRelease() {
   uint32_t now = millis();
+  if (swallowTouch) { swallowTouch = false; gesture = false; return; }
   if (!gesture) {
     if (scrubbing) {
       scrubbing = false;
@@ -561,7 +623,7 @@ static void onRelease() {
     if (ui.pressed != ZONE_NONE) {
       int z = ui.pressed;
       ui.pressed = ZONE_NONE;
-      if (playingVisible()) drawButton(z, ui);
+      if (controlsVisible()) drawButton(z, ui);
     }
     return;
   }
@@ -606,7 +668,7 @@ static void handleTouch() {
 
   int32_t x = 0, y = 0;
   bool touched = lcd.getTouch(&x, &y) > 0;
-  if (touched) { offCount = 0; if (onCount < 250) ++onCount; }
+  if (touched) { offCount = 0; if (onCount < 250) ++onCount; lastTouchMs = now; }
   else         { onCount = 0;  if (offCount < 250) ++offCount; }
 
   if (!down && onCount >= 2)       { down = true; onPress(x, y); }
@@ -644,7 +706,9 @@ static void setupTouchCalibration() {
   Settings stored;
   if (prefs.getBytes("set", &stored, sizeof stored) == sizeof stored && stored.version == settings.version) settings = stored;
   settings.brightness &= 3;
+  settings.saver &= 3;
   fullColorMode = settings.fullColor;
+  artBackdropBlurred = settings.fullColor;
   clockState.h24 = settings.h24;
   prefs.end();
 }
@@ -684,6 +748,30 @@ void setup() {
   sendSettings();
 }
 
+// ---- screensaver
+// The cover floats while music plays (it keeps floating for a few seconds while the next
+// track's cover is on its way); otherwise the sky with a drifting clock.
+static bool saverWantsFloat(uint32_t now) {
+  return hasTrack && ui.playing && (ui.artValid || now - lastMetaMs < 8000);
+}
+
+static void runSaver(uint32_t now) {
+  static uint32_t lastMs = 0;
+  bool wantFloat = saverWantsFloat(now);
+  if (wantFloat != saverFloat) { saverFloat = wantFloat; saverRedraw = true; }
+  if (saverRedraw) {
+    saverRedraw = false;
+    lastMs = now;
+    if (saverFloat) drawFloatStart(ui, floater);
+    else drawSaverSky(clockAt(now), weather, saver, false);
+    return;
+  }
+  if (now - lastMs < (saverFloat ? 60u : SCENE_FRAME_MS)) return;
+  lastMs = now;
+  if (saverFloat) drawFloatStep(ui, floater);
+  else drawSaverSky(clockAt(now), weather, saver, true);
+}
+
 void loop() {
   readSerial();
   handleTouch();
@@ -692,11 +780,23 @@ void loop() {
 
   if (linkUp && now - lastFrameMs > LINK_TIMEOUT_MS) {
     linkUp = false;
-    if (appVisible(APP_MUSIC)) showCurrent();
+    if (saverOn) { saverOn = false; showCurrent(); }
+    else if (appVisible(APP_MUSIC)) showCurrent();
   }
 
   // Blink the light on the back while a reminder or event alert is on screen.
   setLight(alertOpen && settings.alertLight && (now / 350) % 2 == 0);
+
+  // Left alone for long enough: start the screensaver.
+  if (!saverOn && !alertOpen && linkUp && (settings.saver & 3) &&
+      now - lastTouchMs >= (uint32_t)SAVER_MINUTES[settings.saver & 3] * SAVER_MINUTE_MS) {
+    saverOn = true;
+    saverFloat = saverWantsFloat(now);
+    saverRedraw = true;
+    scrubbing = false;
+    ui.pressed = ZONE_NONE;
+  }
+  if (saverOn) { runSaver(now); return; }
 
   if (appVisible(APP_SYSTEM)) {
     static uint32_t lastStatsMs = 0;
@@ -707,7 +807,22 @@ void loop() {
     }
   }
 
-  if (playingVisible()) {
+  // Music left alone while it plays: the controls give way to the full-screen cover.
+  if (controlsVisible() && settings.fullArt && ui.playing && ui.artValid && !scrubbing &&
+      ui.pressed == ZONE_NONE && now - lastTouchMs >= ART_IDLE_MS && now - lastMetaMs >= 1500) {
+    artView = true;
+    showCurrent();
+  }
+
+  if (artViewVisible()) {                       // the visualizer bars
+    static uint32_t lastVizMs = 0;
+    if (now - lastVizMs >= 45) {
+      lastVizMs = now;
+      drawVizBars(viz, ui.playing && now - viz.lastDataMs < 600);
+    }
+  }
+
+  if (controlsVisible()) {
     static uint32_t lastBarMs = 0;
     static uint32_t shownSec = 0xFFFFFFFF;
     static int shownPx = -1;
@@ -729,13 +844,20 @@ void loop() {
     static uint32_t lastSceneMs = 0;
     if (now - lastSceneMs >= SCENE_FRAME_MS) {
       lastSceneMs = now;
-      drawWeatherSky(weather, true);
+      drawWeatherSky(weather, clockAt(now), true);
     }
   }
 
   if (appVisible(APP_CLOCK) && clockState.known) {
     uint32_t e = clockNow(now);
-    if (e != clockShownEpoch) {
+    if (clockImmersive(clockState)) {             // Full color: the time on the animated sky
+      static uint32_t lastClockSkyMs = 0;
+      if (now - lastClockSkyMs >= SCENE_FRAME_MS) {
+        lastClockSkyMs = now;
+        clockState.epoch = clockShownEpoch = e;
+        drawClockSky(clockState, weather, true);
+      }
+    } else if (e != clockShownEpoch) {
       clockState.epoch = e;
       if (e / 60 != clockShownEpoch / 60) {
         if (!(paletteFor(APP_CLOCK) == pal)) { showCurrent(); return; }   // the time of day moved on: new colors
