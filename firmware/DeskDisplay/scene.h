@@ -206,6 +206,17 @@ static void sceneCloud(LGFX_Sprite& s, int x, int y, int u) {
   s.fillCircle(x + 17 * u, y + 6 * u, 3 * u, SC_CLOUD);                          // right puff
 }
 
+// A rain or snow cloud, 22 x 13 cells: the same puffs on top, with a rounded, lumpy underside
+// instead of a flat one. u = pixels per cell.
+static void sceneRainCloud(LGFX_Sprite& s, int x, int y, int u) {
+  for (int i = 0; i < 4; ++i) s.fillCircle(x + (3 + 5 * i) * u, y + 10 * u, 3 * u, SC_CLOUD_SHADE);   // shaded bumps
+  s.fillRoundRect(x, y + 4 * u, 22 * u, 6 * u, 3 * u, SC_CLOUD);                                      // the body
+  for (int i = 0; i < 4; ++i) s.fillCircle(x + (3 + 5 * i) * u, y + 9 * u, 3 * u, SC_CLOUD);         // round bumps underneath
+  s.fillCircle(x + 13 * u / 2, y + 11 * u / 2, 7 * u / 2, SC_CLOUD);                                  // left puff
+  s.fillCircle(x + 12 * u, y + 4 * u, 4 * u, SC_CLOUD);                                               // tall middle puff
+  s.fillCircle(x + 17 * u, y + 6 * u, 3 * u, SC_CLOUD);                                               // right puff
+}
+
 static void sceneShadowText(LGFX_Sprite& s, const char* text, int x, int y, int color, int offset = 1) {
   s.setTextColor(SC_SHADOW); s.drawString(text, x + offset, y + offset);
   s.setTextColor(color);     s.drawString(text, x, y);
@@ -286,12 +297,13 @@ static void sceneRender(const SceneInfo& info, bool advance) {
     sceneCloud(s, (int)st.cloudX[4] - 30, 30, 4);
     sceneCloud(s, (int)st.cloudX[5] + 30, 10, 4);
   } else if (kind >= 4) {                                   // heavy clouds along the top
-    sceneCloud(s, (int)st.cloudX[0], -18, 5);
-    sceneCloud(s, (int)st.cloudX[1] + 20, -24, 5);
-    sceneCloud(s, (int)st.cloudX[2] + 60, -6, 4);
-    sceneCloud(s, (int)st.cloudX[3] + 10, -20, 5);
-    sceneCloud(s, (int)st.cloudX[4] - 20, -10, 4);
-    sceneCloud(s, (int)st.cloudX[5] + 40, -22, 5);
+    // rain, snow and thunderstorms: clouds with a rounded, lumpy underside
+    sceneRainCloud(s, (int)st.cloudX[0], -18, 5);
+    sceneRainCloud(s, (int)st.cloudX[1] + 20, -24, 5);
+    sceneRainCloud(s, (int)st.cloudX[2] + 60, -6, 4);
+    sceneRainCloud(s, (int)st.cloudX[3] + 10, -20, 5);
+    sceneRainCloud(s, (int)st.cloudX[4] - 20, -10, 4);
+    sceneRainCloud(s, (int)st.cloudX[5] + 40, -22, 5);
   }
 
   int count = sceneDropCount(kind);
