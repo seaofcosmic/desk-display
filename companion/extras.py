@@ -107,11 +107,32 @@ def fetch_weather(settings: dict, place=None):
     url = "https://api.open-meteo.com/v1/forecast?" + urllib.parse.urlencode({
         "latitude": place[1], "longitude": place[2],
         "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,is_day",
-        "daily": "weather_code,temperature_2m_max,temperature_2m_min",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset",
         "temperature_unit": "celsius", "wind_speed_unit": "kmh",
         "timezone": "auto", "forecast_days": 3,
     })
     return place, _get_json(url)
+
+
+def _minutes(stamp) -> Optional[int]:
+    """'2026-11-16T06:27' -> 387 (minutes after midnight), or None."""
+    try:
+        clock = str(stamp).split("T")[1]
+        return int(clock[0:2]) * 60 + int(clock[3:5])
+    except (IndexError, ValueError):
+        return None
+
+
+def sun_line(cur: dict, daily: dict) -> bytes:
+    """Day or night, plus today's sunrise and sunset when known: b"D|387|1012". For the animated sky."""
+    flag = "D" if int(cur.get("is_day", 1) or 0) else "N"
+    try:
+        rise, sset = _minutes(daily["sunrise"][0]), _minutes(daily["sunset"][0])
+    except (KeyError, IndexError, TypeError):
+        rise = sset = None
+    if rise is None or sset is None or not 0 <= rise < sset < 1440:
+        return flag.encode()
+    return f"{flag}|{rise}|{sset}".encode()
 
 
 def weather_payload(place, forecast: dict, celsius: bool, h24: bool, to_ascii, fetched_at: datetime.datetime) -> bytes:
@@ -137,7 +158,7 @@ def weather_payload(place, forecast: dict, celsius: bool, h24: bool, to_ascii, f
         (f"{int(round(wind))} KM/H" if celsius else f"{int(round(wind * 0.621371))} MPH").encode(),
         f"{int(round(float(cur['relative_humidity_2m'])))}%".encode(),
         fmt_clock(fetched_at.hour, fetched_at.minute, h24).encode(),
-        b"D" if int(cur.get("is_day", 1) or 0) else b"N",       # day or night, for the animated sky
+        sun_line(cur, daily),
     ]
     for i, day in enumerate(daily["time"][:3]):
         name = "TODAY" if i == 0 else datetime.date.fromisoformat(day).strftime("%a").upper()
@@ -151,19 +172,40 @@ def weather_error(message: str) -> bytes:
 
 
 # Made-up weather for --demo. It steps through these so every animated sky can be seen:
-# (Open-Meteo weather code, 1 = day or 0 = night)
-DEMO_SKIES = [(0, 1), (2, 1), (63, 1), (95, 0), (73, 0), (45, 1), (3, 1), (0, 0)]
+# (Open-Meteo weather code, time of day)
+DEMO_SKIES = [(0, "day"), (0, "dusk"), (2, "day"), (63, "day"), (2, "dawn"), (95, "night"), (73, "night"),
+              (45, "day"), (3, "dusk"), (0, "night")]
 DEMO_SKY_SECONDS = 8
 
 
-def demo_forecast(step: int = 0, today: Optional[datetime.date] = None) -> dict:
+def _demo_sun(phase: str, now: int):
+    """Sunrise and sunset (minutes after midnight) that make this minute fall in the wanted time of day.
+    (Within about half an hour of midnight some of them cannot be made, and the sky shown is a different one.)"""
+    if phase == "dawn":
+        rise = min(max(now, 0), 1438)
+        return rise, min(1439, rise + 480)
+    if phase == "dusk":
+        sset = min(max(now, 60), 1439)
+        return max(0, sset - 480), sset
+    if phase == "night":
+        return (120, now - 120) if now >= 720 else (now + 120, min(1439, now + 600))
+    return max(0, now - 300), min(1439, max(now + 300, 301))
+
+
+def demo_forecast(step: int = 0, today: Optional[datetime.date] = None, now: Optional[int] = None) -> dict:
     today = today or datetime.date.today()
-    code, is_day = DEMO_SKIES[step % len(DEMO_SKIES)]
+    if now is None:
+        t = datetime.datetime.now()
+        now = t.hour * 60 + t.minute
+    code, phase = DEMO_SKIES[step % len(DEMO_SKIES)]
+    rise, sset = _demo_sun(phase, now)
     days = [(today + datetime.timedelta(days=i)).isoformat() for i in range(3)]
+    stamp = lambda m: f"{days[0]}T{m // 60:02d}:{m % 60:02d}"
     return {"current": {"temperature_2m": 20.0, "relative_humidity_2m": 61, "apparent_temperature": 19.0,
-                        "weather_code": code, "wind_speed_10m": 13.0, "is_day": is_day},
+                        "weather_code": code, "wind_speed_10m": 13.0, "is_day": 0 if phase == "night" else 1},
             "daily": {"time": days, "weather_code": [code, 63, 0],
-                      "temperature_2m_max": [22.2, 17.8, 23.9], "temperature_2m_min": [12.8, 11.1, 13.3]}}
+                      "temperature_2m_max": [22.2, 17.8, 23.9], "temperature_2m_min": [12.8, 11.1, 13.3],
+                      "sunrise": [stamp(rise)] * 3, "sunset": [stamp(sset)] * 3}}
 
 
 # --------------------------------------------------------------------------- reminders

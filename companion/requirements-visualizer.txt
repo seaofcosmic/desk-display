@@ -1,0 +1,6 @@
+# Only for the music visualizer on Windows: lets the bars follow the sound the computer is playing.
+# Without these the display still works and the bars follow a made-up pattern.
+numpy>=1.26; sys_platform == "win32"
+PyAudioWPatch>=0.2.12; sys_platform == "win32"
+# Lets the bars hear only Apple Music, not other apps (Windows 10 version 2004 or later, or Windows 11).
+proc-tap>=1.1; sys_platform == "win32"

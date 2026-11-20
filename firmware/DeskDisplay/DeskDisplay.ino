@@ -249,8 +249,18 @@ static bool refreshMusicPalette() {
 }
 
 // Tells the computer the settings it needs: clock format, weather unit, which alerts to send.
+// Copies the settings the drawing code reads into its own variables.
+static void applyLookSettings() {
+  fullColorMode = settings.fullColor;
+  artBackdropBlurred = settings.fullColor;
+  sunGlowOn = settings.sunGlow;
+  clockSkyOn = settings.clockSky;
+  artvShift = settings.visualizer ? 0 : 20;
+}
+
 static void sendSettings() {
-  Serial.printf("DT:SET:H24=%d,WC=%d,RA=%d,CA=%d\n", settings.h24, settings.weatherC, settings.reminderAlerts, settings.eventAlerts);
+  Serial.printf("DT:SET:H24=%d,WC=%d,RA=%d,CA=%d,VZ=%d\n", settings.h24, settings.weatherC, settings.reminderAlerts,
+                settings.eventAlerts, settings.visualizer);
 }
 
 static void saveSettings() {
@@ -486,6 +496,7 @@ static int  trailX[3] = { 0, 0, 0 }, trailY[3] = { 0, 0, 0 };
 static int  trailLen = 0;
 static int  pressedTile = -1;
 static bool swallowTouch = false;    // this touch only woke the screensaver
+static uint32_t openButtonLitMs = 0; // when Open Apple Music was tapped (0 = not lit)
 
 static const int SWIPE_MIN = 45;     // pixels a finger must travel to count as a swipe
 static const int TAP_MAX   = 18;     // pixels a finger may wander and still count as a tap
@@ -497,7 +508,7 @@ static void changeSetting(int i) {
   drawSettingsRow(settings, setPage, i);
   switch (i) {
     case SET_LOOK:                            // the look changed: repaint in the new colors
-      fullColorMode = settings.fullColor;
+      applyLookSettings();
       weatherDetails = false;
       refreshMusicPalette();
       showCurrent();
@@ -506,6 +517,9 @@ static void changeSetting(int i) {
     case SET_TIME: clockState.h24 = settings.h24; sendSettings(); break;
     case SET_WEATHER_UNIT: case SET_REMINDER_ALERTS: case SET_EVENT_ALERTS: sendSettings(); break;
     case SET_BRIGHTNESS: applyBrightness(); break;
+    case SET_FULL_ART: if (!settings.cover) artView = false; break;
+    case SET_VISUALIZER: applyLookSettings(); sendSettings(); break;   // the companion stops or starts sending sound levels
+    case SET_CLOCK_SKY: case SET_SUN_GLOW: applyLookSettings(); break;
   }
 }
 
@@ -524,7 +538,11 @@ static void onTap(int x, int y) {
   if (app == APP_MUSIC && musicView() == VIEW_PLAYING) {
     // Tapping the cover makes it fill the screen; tapping the full-screen cover brings the controls back.
     if (artView) { artView = false; showCurrent(); }
-    else if (x < ART_X + ART_SIZE + 4 && y < BAR_AREA_Y - 6) { artView = true; showCurrent(); }
+    else if (settings.cover && x < ART_X + ART_SIZE + 4 && y < BAR_AREA_Y - 6) { artView = true; showCurrent(); }
+  } else if (app == APP_MUSIC && musicView() == VIEW_STANDBY && openButtonAt(x, y)) {
+    Serial.print("DT:CMD:OPENAPP\n");          // the computer opens Apple Music
+    drawOpenButton(true);
+    openButtonLitMs = millis();
   } else if (app == APP_REMINDERS && reminders.valid) {
     int i = reminderAt(reminders, remPage, y);
     if (i == -2) {
@@ -707,8 +725,8 @@ static void setupTouchCalibration() {
   if (prefs.getBytes("set", &stored, sizeof stored) == sizeof stored && stored.version == settings.version) settings = stored;
   settings.brightness &= 3;
   settings.saver &= 3;
-  fullColorMode = settings.fullColor;
-  artBackdropBlurred = settings.fullColor;
+  if (settings.cover > 2) settings.cover = 2;
+  applyLookSettings();
   clockState.h24 = settings.h24;
   prefs.end();
 }
@@ -787,16 +805,34 @@ void loop() {
   // Blink the light on the back while a reminder or event alert is on screen.
   setLight(alertOpen && settings.alertLight && (now / 350) % 2 == 0);
 
-  // Left alone for long enough: start the screensaver.
+  // Left alone for long enough: start the screensaver. While music plays, show the music
+  // (the full-screen cover with its bars, if that setting allows) instead of a screensaver.
   if (!saverOn && !alertOpen && linkUp && (settings.saver & 3) &&
       now - lastTouchMs >= (uint32_t)SAVER_MINUTES[settings.saver & 3] * SAVER_MINUTE_MS) {
+    if (hasTrack && ui.playing) {
+      if (!playingVisible() || (!artView && settings.cover)) {
+        app = APP_MUSIC;
+        menuOpen = false;
+        weatherDetails = false;
+        scrubbing = false;
+        ui.pressed = ZONE_NONE;
+        if (settings.cover) artView = true;
+        showCurrent();
+      }
+    } else {
     saverOn = true;
     saverFloat = saverWantsFloat(now);
     saverRedraw = true;
     scrubbing = false;
     ui.pressed = ZONE_NONE;
+    }
   }
   if (saverOn) { runSaver(now); return; }
+
+  if (openButtonLitMs && now - openButtonLitMs > 4000) {      // nothing started: back to the plain button
+    openButtonLitMs = 0;
+    if (appVisible(APP_MUSIC) && musicView() == VIEW_STANDBY) drawOpenButton(false);
+  }
 
   if (appVisible(APP_SYSTEM)) {
     static uint32_t lastStatsMs = 0;
@@ -808,15 +844,15 @@ void loop() {
   }
 
   // Music left alone while it plays: the controls give way to the full-screen cover.
-  if (controlsVisible() && settings.fullArt && ui.playing && ui.artValid && !scrubbing &&
+  if (controlsVisible() && settings.cover == 2 && ui.playing && ui.artValid && !scrubbing &&
       ui.pressed == ZONE_NONE && now - lastTouchMs >= ART_IDLE_MS && now - lastMetaMs >= 1500) {
     artView = true;
     showCurrent();
   }
 
-  if (artViewVisible()) {                       // the visualizer bars
+  if (artViewVisible() && settings.visualizer) {   // the visualizer bars
     static uint32_t lastVizMs = 0;
-    if (now - lastVizMs >= 45) {
+    if (now - lastVizMs >= 30) {                 // about 33 times a second
       lastVizMs = now;
       drawVizBars(viz, ui.playing && now - viz.lastDataMs < 600);
     }

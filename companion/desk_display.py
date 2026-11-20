@@ -28,6 +28,7 @@ import os
 import queue
 import struct
 import sys
+import subprocess
 import threading
 import time
 import unicodedata
@@ -35,6 +36,7 @@ import urllib.parse
 import urllib.request
 from typing import Optional
 
+import audio_levels
 import extras
 import notion_calendar
 import pc_stats
@@ -229,6 +231,8 @@ class Link:
                 text = line.decode("ascii", "ignore").strip()
                 if text.startswith("DT:"):
                     self.lines.put(text)
+                elif text:
+                    self.lines.put("RAW:" + text)        # anything else the board prints, such as a crash report
             if len(buf) > 4096:
                 buf = buf[-256:]
 
@@ -257,7 +261,7 @@ def find_port(preferred: Optional[str]) -> Optional[str]:
 
 # --------------------------------------------------------------------------- main loop
 class Companion:
-    ART_RETRY_AT = (0.3, 1.5, 3.5, 6.0)     # seconds after a track change; the picture can arrive late
+    ART_RETRY_AT = (0.3, 0.9, 1.6, 2.5, 3.5, 5.0, 7.0, 10.0, 13.0)   # seconds after a track change; covers can arrive late
 
     def __init__(self, media, args):
         self.media = media
@@ -266,9 +270,15 @@ class Companion:
 
         self.settings = extras.load_settings(args.data_dir, self.log)
         # What the display's Settings app is set to. The display reports these when it connects.
-        self.device = {"H24": 0, "WC": 0, "RA": 1, "CA": 1}
+        self.device = {"H24": 0, "WC": 1, "RA": 1, "CA": 1, "VZ": 1}   # the display's settings, until it reports them
         self.reminders = extras.Reminders(os.path.join(args.data_dir, "reminders.txt"), False, to_ascii)
         self.stats = pc_stats.PcStats()
+        self.levels = audio_levels.Levels(self.log, args.verbose, pretend=args.demo,
+                                          app=getattr(args, "app", None))         # for the visualizer
+        try:   # settings.json "visualizer_delay_ms": hold the bars back this long (for Bluetooth headphones)
+            self.viz_delay = max(0.0, min(1.0, float(self.settings.get("visualizer_delay_ms", 0)) / 1000.0))
+        except (TypeError, ValueError):
+            self.viz_delay = 0.0
         self.fired_events = set()
 
         self.weather = ("err", "Getting the weather.")      # or ("ok", place, forecast, fetched at)
@@ -390,8 +400,30 @@ class Companion:
     def log(self, *a):
         print(time.strftime("%H:%M:%S"), *a, flush=True)
 
+    def _watch_for_freezes(self):
+        """Runs in the background. If the main loop stops moving for a few seconds, says where it is stuck."""
+        import traceback
+        main_id = None
+        reported = 0.0
+        while True:
+            time.sleep(1.0)
+            beat = getattr(self, "_beat", None)
+            if beat is None:
+                continue
+            stuck = time.monotonic() - beat
+            if stuck > 3.0 and beat != reported:
+                reported = beat
+                frame = sys._current_frames().get(main_id or getattr(self, "_loop_ident", 0))
+                where = traceback.format_stack(frame)[-4:] if frame else ["(unknown)"]
+                self.log(f"The companion has been stuck for {stuck:.0f} seconds here:")
+                for part in where:
+                    for line in part.rstrip().splitlines():
+                        self.log("   ", line.strip())
+
     def run(self):
+        threading.Thread(target=self._watch_for_freezes, daemon=True).start()
         waiting_shown = False
+        busy_shown = False
         while True:
             port = find_port(self.args.port)
             if not port:
@@ -409,13 +441,22 @@ class Companion:
             except KeyboardInterrupt:
                 raise
             except Exception as e:
-                self.log(f"Lost the display ({e}). Trying again.")
+                if "Access is denied" in str(e) or isinstance(e, PermissionError):
+                    if not busy_shown:          # say it once, then keep trying quietly
+                        self.log(f"{port} is in use by another program, most likely another copy of this companion "
+                                 "(the taskbar icon). Quit that one and this one connects by itself.")
+                        busy_shown = True
+                else:
+                    busy_shown = False
+                    self.log(f"Lost the display ({e}). Trying again.")
             finally:
+                self._beat = None                 # not talking to the display now: nothing to watch
                 if link:
                     link.close()
             time.sleep(2)
 
     def session(self, link: Link):
+        self._loop_ident = threading.get_ident()      # the thread to look at if the companion freezes
         ready = False
         last_hello = 0.0
         sent_key = None
@@ -436,9 +477,14 @@ class Companion:
         last_calendar_at = 0.0
         weather_sent = None
         calendar_sent = None
+        last_levels_at = 0.0
+        levels_sent = None
+        old_art, old_album, last_album, track_started = None, None, None, 0.0
+        viz_queue = []
 
         while True:
             now = time.monotonic()
+            self._beat = now
             if link.error:
                 raise link.error
 
@@ -448,8 +494,16 @@ class Companion:
                     line = link.lines.get_nowait()
                 except queue.Empty:
                     break
+                if line.startswith("RAW:"):
+                    if any(k in line for k in ("Guru", "panic", "Brownout", "rst:", "Backtrace", "abort", "assert", "Stack", "WDT")):
+                        self.log("display says:", line[4:200])
+                    elif self.args.verbose:
+                        self.log("display says:", line[4:200])
+                    continue
                 if line.startswith("DT:READY"):
-                    if not ready:
+                    if ready:
+                        self.log("The display restarted.")
+                    else:
                         self.log("Display connected.")
                     ready = True
                     sent_key, last_state, art_hash, art_frame = None, None, None, None
@@ -555,11 +609,30 @@ class Companion:
                         sent_key = current.key()
                         last_state = None
                         art_due = [now + t for t in self.ART_RETRY_AT]
+                        # The music app can hand over the last song's cover for a moment: remember it, to skip it.
+                        old_art, old_album = art_hash, last_album
+                        last_album = current.album
+                        track_started = now
                         art_hash, art_frame, online_started = None, None, False
                     state = (current.playing, current.can_seek, current.duration_ms, current.position_ms is None)
                     if state != last_state or now - last_state_at >= 1.0:
                         link.send(encode_state(current))
                         last_state, last_state_at = state, now
+
+            # ---- sound levels for the visualizer, about 14 times a second while music plays
+            if now - last_levels_at >= 0.04:              # 25 times a second
+                last_levels_at = now
+                levels = self.levels.read(bool(current and current.playing and self.device["VZ"]))
+                if self.viz_delay > 0:                     # hold the bars back to match slow (e.g. Bluetooth) speakers
+                    viz_queue.append((now, levels))
+                    levels = None
+                    while viz_queue and now - viz_queue[0][0] >= self.viz_delay:
+                        levels = viz_queue.pop(0)[1]
+                    if len(viz_queue) > 200:
+                        del viz_queue[:-200]
+                if levels is not None and (levels != levels_sent or any(levels)):
+                    link.send(frame(b"V", levels))
+                    levels_sent = levels
 
             # ---- album art
             if art_due and now >= art_due[0] and current is not None and current.key() == sent_key:
@@ -572,7 +645,10 @@ class Companion:
                         self.log("art error:", repr(e))
                 if data:
                     h = hashlib.sha1(data).digest()
-                    if h != art_hash:
+                    stale = h == old_art and current.album != old_album      # the previous song's cover, late
+                    if stale and self.args.verbose:
+                        self.log("skipped the previous song's cover; asking again")
+                    if h != art_hash and not stale:
                         try:
                             art_frame = encode_art(data)
                             link.send(art_frame)
@@ -580,7 +656,7 @@ class Companion:
                         except Exception as e:
                             if self.args.verbose:
                                 self.log("could not read the picture:", repr(e))
-                elif art_hash is None and not online_started and len(art_due) <= 2 and not self.args.no_online_art:
+                if art_hash is None and not online_started and now - track_started >= 3.0 and not self.args.no_online_art:
                     online_started = True
                     threading.Thread(target=self._online_art, args=(current,), daemon=True).start()
 
@@ -598,7 +674,7 @@ class Companion:
                     link.send(art_frame)
                     art_hash = hashlib.sha1(data).digest()
 
-            time.sleep(0.03)
+            time.sleep(0.01)
 
     def _online_art(self, np: NowPlaying):
         self.online_results.put((np.key(), lookup_art_online(np)))
@@ -613,22 +689,62 @@ class Companion:
                 self.media.previous()
             elif cmd.startswith("SEEK:"):
                 self.media.seek(int(cmd[5:]))
+            elif cmd == "OPENAPP":
+                self.log("Opening Apple Music.")
+                threading.Thread(target=open_music_app, args=(self.log,), daemon=True).start()
             if self.args.verbose:
                 self.log("display:", cmd)
         except Exception as e:
             self.log(f"Could not do '{cmd}': {e}")
 
 
+APPLE_MUSIC_WINDOWS_ID = "AppleInc.AppleMusicWin_nzyj5cx40ttqa!App"   # the Microsoft Store app's usual ID
+_music_app_id = None
+
+
+def open_music_app(log=print):
+    """Starts Apple Music (or brings it to the front). Windows: the Store app, or iTunes if that's
+    what's installed. Mac: the Music app."""
+    global _music_app_id
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-a", "Music"], timeout=10)
+            return
+        if sys.platform != "win32":
+            log("Opening Apple Music only works on Windows and Mac.")
+            return
+        if _music_app_id is None:
+            # Ask Windows for the app's ID, since it can differ between installs.
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-StartApps | Where-Object { $_.Name -eq 'Apple Music' -or $_.Name -eq 'iTunes' } | "
+                 "Sort-Object Name | Select-Object -First 1 -ExpandProperty AppID"],
+                capture_output=True, text=True, timeout=15,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).stdout.strip()
+            _music_app_id = out.splitlines()[0].strip() if out else APPLE_MUSIC_WINDOWS_ID
+        subprocess.Popen(["explorer.exe", "shell:AppsFolder\\" + _music_app_id])
+    except Exception as e:
+        log(f"Could not open Apple Music: {e}")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Send what's playing to the Desk Display.")
     ap.add_argument("--port", help="serial port of the display, e.g. COM5 or /dev/cu.usbserial-110 (found automatically if left out)")
     ap.add_argument("--demo", action="store_true", help="show fake tracks instead of real music, to test the display")
-    ap.add_argument("--app", help="Windows only: follow one app, e.g. --app applemusic (default: whatever Windows is showing)")
+    ap.add_argument("--app", help="Windows only: the app to follow and control (default: applemusic). "
+                                   "--app any follows whatever Windows is showing")
     ap.add_argument("--no-online-art", action="store_true", help="never look covers up online when the music app has none")
     ap.add_argument("--data-dir", default=os.path.dirname(os.path.abspath(__file__)),
                     help="folder holding settings.json and reminders.txt (default: this folder)")
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--tray", action="store_true", help="Windows: run as an icon in the taskbar corner, with no window")
     args = ap.parse_args()
+    if sys.platform == "win32" and not args.demo:
+        # Only Apple Music: the display shows and controls nothing else (no browser tabs, games or videos).
+        if args.app is None:
+            args.app = "applemusic"
+        elif args.app.strip().lower() in ("any", "all", "*"):
+            args.app = None
 
     try:
         import serial  # noqa: F401
@@ -636,11 +752,26 @@ def main():
     except ImportError:
         sys.exit("Missing packages. Run:  python -m pip install -r requirements.txt")
 
-    media = make_media(args)
-    try:
+    def start():
+        if args.demo:
+            media = make_media(args)
+        else:
+            from media_worker import MediaWorker      # keeps a stuck music app from freezing the link to the display
+            log = lambda *a: print(time.strftime("%H:%M:%S"), *a, flush=True)
+            media = MediaWorker(lambda: make_media(args), log=log, verbose=args.verbose)
         Companion(media, args).run()
+
+    if args.tray:
+        import tray
+        tray.run(start, args.data_dir)
+        os._exit(0)
+    try:
+        start()
     except KeyboardInterrupt:
-        print("\nStopped.")
+        print("\nStopped.", flush=True)
+    # End right away. A helper still waiting on the music app or the sound card
+    # must not keep the companion running in the background.
+    os._exit(0)
 
 
 if __name__ == "__main__":

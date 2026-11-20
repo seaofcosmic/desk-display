@@ -29,8 +29,10 @@ class WindowsMedia:
         self.manager = self._run(SessionManager.request_async())
         self._props = None
 
-    def _run(self, operation):
-        return self.loop.run_until_complete(_wait(operation))
+    def _run(self, operation, timeout: float = 3.0):
+        # Windows sometimes never answers (Apple Music's cover is known for it). Give up after a few
+        # seconds instead of freezing the companion, which would leave the display on NO SIGNAL.
+        return self.loop.run_until_complete(asyncio.wait_for(_wait(operation), timeout))
 
     def _session(self):
         if self.app_filter:
@@ -75,7 +77,11 @@ class WindowsMedia:
         else:
             duration_ms = 0
 
-        can_seek = bool(info.controls.is_playback_position_enabled) and duration_ms > 0
+        # Apple Music for Windows ignores requests to jump to a spot in the song, so the bar is
+        # locked for it (it still shows the position). Other apps get to try whenever the song has
+        # a length, even if they say they can't: some say so and can anyway.
+        app_id = (s.source_app_user_model_id or "").lower().replace(" ", "")
+        can_seek = duration_ms > 0 and "applemusic" not in app_id
         return NowPlaying(props.title, artist, album, playing, position_ms, duration_ms, can_seek)
 
     def get_art(self, np: NowPlaying) -> Optional[bytes]:
@@ -95,7 +101,7 @@ class WindowsMedia:
             finally:
                 stream.close()
 
-        return self.loop.run_until_complete(read())
+        return self.loop.run_until_complete(asyncio.wait_for(read(), 2.0))
 
     def play_pause(self):
         s = self._session()
@@ -116,4 +122,6 @@ class WindowsMedia:
         s = self._session()
         if s:
             start_ticks = int(s.get_timeline_properties().start_time.total_seconds() * 10_000_000)
-            self._run(s.try_change_playback_position_async(start_ticks + int(ms) * 10_000))
+            ok = self._run(s.try_change_playback_position_async(start_ticks + int(ms) * 10_000))
+            if not ok:
+                raise RuntimeError("the music app did not allow jumping to that spot in the song")

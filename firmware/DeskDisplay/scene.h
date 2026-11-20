@@ -37,6 +37,8 @@ struct SceneInfo {
 };
 
 static const int SCENE_DROPS = 150, SCENE_CLOUDS = 6, SCENE_STARS = 48, SCENE_BOLT_POINTS = 9;
+static const int SCENE_SPLASHES = 96;     // splash droplets alive at once (the oldest are reused)
+static const int SCENE_DROP_LEN = 9;      // raindrop length in pixels
 struct SceneState {
   int kind = -1, phase = -1;
   bool plain = false;
@@ -49,6 +51,12 @@ struct SceneState {
   int boltFrames = 0;       // frames the bolt stays visible
   int nextBolt = 30;        // frames until the next lightning
   int16_t boltX[SCENE_BOLT_POINTS], boltY[SCENE_BOLT_POINTS];
+  // rain splashing off the bottom of the screen
+  int16_t splashX[SCENE_SPLASHES], splashY[SCENE_SPLASHES];
+  int8_t  splashVX[SCENE_SPLASHES], splashVY[SCENE_SPLASHES];
+  uint8_t splashLife[SCENE_SPLASHES];      // frames left, 0 = not in use
+  bool    splashFlat[SCENE_SPLASHES];      // the short flat mark where the drop landed
+  uint8_t splashNext = 0;
 };
 
 static LGFX_Sprite* sceneSprite = nullptr;
@@ -149,6 +157,7 @@ static void sceneStart(SceneState& st, const SceneInfo& info) {
   st.plain = info.plain;
   st.frame = 0;
   st.flash = 0; st.boltFrames = 0; st.nextBolt = 20;
+  for (int i = 0; i < SCENE_SPLASHES; ++i) st.splashLife[i] = 0;
   for (int i = 0; i < SCENE_CLOUDS; ++i) st.cloudX[i] = (float)(i * 78) - 60.0f + (float)sceneRandom(st, 40);
   for (int i = 0; i < SCENE_DROPS; ++i) {
     st.dropX[i] = (int16_t)sceneRandom(st, SCENE_W + 60);
@@ -156,6 +165,25 @@ static void sceneStart(SceneState& st, const SceneInfo& info) {
     st.dropSpeed[i] = (uint8_t)(info.kind == 5 ? 1 + sceneRandom(st, 2) : 8 + sceneRandom(st, 5));
   }
   sceneColors(info);
+}
+
+// A raindrop lands on the bottom edge: a flat mark, and two droplets (three in a storm)
+// that hop up and outward a few pixels and fall back.
+static void sceneSplash(SceneState& st, int x) {
+  int slot = st.splashNext++ % SCENE_SPLASHES;
+  st.splashX[slot] = (int16_t)x; st.splashY[slot] = SCENE_H - 1;
+  st.splashVX[slot] = 0; st.splashVY[slot] = 0; st.splashFlat[slot] = true; st.splashLife[slot] = 2;
+  int count = st.kind == 6 ? 3 : 2;
+  for (int k = 0; k < count; ++k) {
+    slot = st.splashNext++ % SCENE_SPLASHES;
+    int side = (k == 2) ? (int)sceneRandom(st, 3) - 1 : (k == 0 ? -1 : 1);
+    st.splashX[slot] = (int16_t)(x + side);
+    st.splashY[slot] = SCENE_H - 3;
+    st.splashVX[slot] = (int8_t)(side * (1 + (int)sceneRandom(st, 2)));
+    st.splashVY[slot] = (int8_t)(-2 - (int)sceneRandom(st, st.kind == 6 ? 3 : 2));
+    st.splashFlat[slot] = false;
+    st.splashLife[slot] = 7;
+  }
 }
 
 static void sceneStep(SceneState& st) {
@@ -167,10 +195,20 @@ static void sceneStep(SceneState& st) {
   }
   int count = sceneDropCount(st.kind);
   if (st.kind == 4 || st.kind == 6) {                       // rain: fast, slanting left
+    for (int i = 0; i < SCENE_SPLASHES; ++i) {              // splashes already in the air
+      if (!st.splashLife[i]) continue;
+      --st.splashLife[i];
+      if (st.splashFlat[i]) continue;
+      st.splashX[i] += st.splashVX[i];
+      st.splashY[i] += st.splashVY[i];
+      st.splashVY[i] += 1;                                  // gravity
+      if (st.splashY[i] >= SCENE_H) st.splashLife[i] = 0;
+    }
     for (int i = 0; i < count; ++i) {
       st.dropY[i] += st.dropSpeed[i];
       st.dropX[i] -= 1;
-      if (st.dropY[i] >= SCENE_H) { st.dropY[i] = (int16_t)(SCENE_RAIN_TOP + sceneRandom(st, 14)); st.dropX[i] = (int16_t)sceneRandom(st, SCENE_W + 60); }
+      if (st.dropY[i] + SCENE_DROP_LEN >= SCENE_H) {
+        if (st.dropX[i] >= 0 && st.dropX[i] < SCENE_W) sceneSplash(st, st.dropX[i]); st.dropY[i] = (int16_t)(SCENE_RAIN_TOP + sceneRandom(st, 14)); st.dropX[i] = (int16_t)sceneRandom(st, SCENE_W + 60); }
     }
   } else if (st.kind == 5) {                                // snow: slow, swaying
     for (int i = 0; i < count; ++i) {
@@ -308,7 +346,12 @@ static void sceneRender(const SceneInfo& info, bool advance) {
 
   int count = sceneDropCount(kind);
   if (kind == 4 || kind == 6) {
-    for (int i = 0; i < count; ++i) s.fillRect(st.dropX[i], st.dropY[i], 2, 9, SC_DROP);
+    for (int i = 0; i < count; ++i) s.fillRect(st.dropX[i], st.dropY[i], 2, SCENE_DROP_LEN, SC_DROP);
+    for (int i = 0; i < SCENE_SPLASHES; ++i) {
+      if (!st.splashLife[i]) continue;
+      if (st.splashFlat[i]) s.fillRect(st.splashX[i] - 2, SCENE_H - 1, 5, 1, SC_DROP);
+      else                  s.fillRect(st.splashX[i], st.splashY[i], 2, 2, SC_DROP);
+    }
   } else if (kind == 5) {
     for (int i = 0; i < count; ++i) s.fillRect(st.dropX[i], st.dropY[i], 3, 3, SC_DROP);
   }

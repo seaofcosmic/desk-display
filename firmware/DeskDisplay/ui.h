@@ -28,7 +28,7 @@ static const int TEXT_X = 162, TEXT_W = 150;              // text column right o
 static const int LABEL_Y = 8, TITLE_Y = 28;
 static const int TITLE_LINE_H = 21, BODY_LINE_H = 16;
 
-static const int BAR_AREA_Y = 148, BAR_AREA_H = 44;       // strip holding gauge + times
+static const int BAR_AREA_Y = 151, BAR_AREA_H = 44;       // strip holding gauge + times (starts below the cover's frame)
 static const int BAR_X = 8, BAR_W = 304;                  // gauge, relative to the strip
 static const int BAR_Y = 8, BAR_H = 12;
 static const int SEG_PITCH = 8, SEG_W = 6;                // gauge segments
@@ -340,7 +340,34 @@ static void drawMessageScreen(const char* big, const char* line1, const char* li
 
 static const char* const MENU_HINT = "SWIPE DOWN FOR MENU";
 static void drawNoLink()  { drawMessageScreen("NO SIGNAL", "Waiting for the computer.", "Start the companion app.", MENU_HINT); }
-static void drawStandby() { drawMessageScreen("STANDBY", "Nothing is playing.", nullptr, MENU_HINT); }
+// Nothing playing: a button that opens Apple Music on the computer.
+static const int OPEN_BTN_W = 256, OPEN_BTN_H = 38, OPEN_BTN_X = (SCREEN_W - OPEN_BTN_W) / 2, OPEN_BTN_Y = 148;
+
+static bool openButtonAt(int x, int y) {
+  return x >= OPEN_BTN_X - 6 && x < OPEN_BTN_X + OPEN_BTN_W + 6 && y >= OPEN_BTN_Y - 6 && y < OPEN_BTN_Y + OPEN_BTN_H + 6;
+}
+
+// busy = it was just tapped: shown lit, with "OPENING..." while the computer starts the app.
+static void drawOpenButton(bool busy) {
+  gfx->startWrite();
+  gfx->fillRect(OPEN_BTN_X, OPEN_BTN_Y, OPEN_BTN_W, OPEN_BTN_H, busy ? pal.accent : pal.bg);
+  gfx->drawRect(OPEN_BTN_X, OPEN_BTN_Y, OPEN_BTN_W, OPEN_BTN_H, pal.accent);
+  gfx->drawRect(OPEN_BTN_X + 1, OPEN_BTN_Y + 1, OPEN_BTN_W - 2, OPEN_BTN_H - 2, pal.accent);
+  uint32_t ink = busy ? pal.bg : pal.accent;
+  int cx = OPEN_BTN_X + 20, cy = OPEN_BTN_Y + OPEN_BTN_H / 2;            // a small play triangle
+  gfx->fillTriangle(cx - 5, cy - 8, cx - 5, cy + 8, cx + 8, cy, ink);
+  gfx->setTextDatum(lgfx::textdatum_t::middle_center);
+  gfx->setFont(FONT_TITLE);
+  gfx->setTextColor(ink);
+  gfx->drawString(busy ? "OPENING..." : "OPEN APPLE MUSIC", OPEN_BTN_X + 40 + (OPEN_BTN_W - 48) / 2, cy + 1);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->endWrite();
+}
+
+static void drawStandby() {
+  drawMessageScreen("STANDBY", "Nothing is playing.", nullptr, MENU_HINT);
+  drawOpenButton(false);
+}
 
 
 // ---------------------------------------------------------------- now-playing pieces
@@ -486,6 +513,7 @@ static void drawPlayingScreen(const UiState& s) {
 static const int AB_W = 40, AB_H = 30;                 // size of the small blurred copy
 static uint8_t artBlur[AB_W * AB_H * 3];
 static bool    artBackdropBlurred = true;              // false: plain background (Minimal look)
+static int     artvShift = 0;                          // moves the cover and text down when the bars are off
 static const int ARTV_KEEP = 50;                       // how much of the blurred cover's brightness to keep
 
 static const int ARTV_X = (SCREEN_W - ART_SIZE) / 2, ARTV_Y = 10;
@@ -522,15 +550,15 @@ static void artBackdrop(int x, int y, int w, int h) {
 }
 
 static void drawArtViewText(const UiState& s) {
-  artBackdrop(0, ARTV_TEXT_Y, SCREEN_W, ARTV_TEXT_H);
+  artBackdrop(0, ARTV_TEXT_Y + artvShift, SCREEN_W, ARTV_TEXT_H);
   gfx->startWrite();
   gfx->setTextDatum(lgfx::textdatum_t::top_center);
   gfx->setFont(FONT_TITLE);
   gfx->setTextColor(0xFFFFFFu);
-  drawWrapped(s.title[0] ? s.title : "Unknown track", SCREEN_W / 2, ARTV_TEXT_Y + 2, SCREEN_W - 24, 1, TITLE_LINE_H);
+  drawWrapped(s.title[0] ? s.title : "Unknown track", SCREEN_W / 2, ARTV_TEXT_Y + artvShift + 2, SCREEN_W - 24, 1, TITLE_LINE_H);
   gfx->setFont(FONT_BODY);
   gfx->setTextColor(artBackdropBlurred ? 0xD6DEE8u : musicPal.accent);
-  if (s.artist[0]) drawWrapped(s.artist, SCREEN_W / 2, ARTV_TEXT_Y + 24, SCREEN_W - 24, 1, BODY_LINE_H);
+  if (s.artist[0]) drawWrapped(s.artist, SCREEN_W / 2, ARTV_TEXT_Y + artvShift + 24, SCREEN_W - 24, 1, BODY_LINE_H);
   gfx->setTextDatum(lgfx::textdatum_t::top_left);
   gfx->endWrite();
 }
@@ -543,8 +571,8 @@ static void drawArtViewCover(const UiState& s, int x, int y) {
 static void drawArtView(const UiState& s) {
   artBackdrop(0, 0, SCREEN_W, SCREEN_H);
   gfx->fillRect(SCREEN_W / 2 - 22, 1, 44, 3, 0xD6DEE8u);
-  gfx->drawRect(ARTV_X - 1, ARTV_Y - 1, ART_SIZE + 2, ART_SIZE + 2, 0xFFFFFFu);
-  drawArtViewCover(s, ARTV_X, ARTV_Y);
+  gfx->drawRect(ARTV_X - 1, ARTV_Y + artvShift - 1, ART_SIZE + 2, ART_SIZE + 2, 0xFFFFFFu);
+  drawArtViewCover(s, ARTV_X, ARTV_Y + artvShift);
   drawArtViewText(s);
 }
 
@@ -566,7 +594,7 @@ static void drawVizBars(VizState& v, bool live) {
   for (int i = 0; i < VIZ_BARS; ++i) {
     float want = live ? v.target[i] * VIZ_H / 255.0f : 0.0f;
     if (want > v.level[i]) v.level[i] = want;                       // jump up with the sound
-    else v.level[i] -= (v.level[i] - want) * 0.28f + 0.4f;          // sink back down
+    else v.level[i] -= (v.level[i] - want) * 0.4f + 0.6f;           // sink back down quickly, so beats stay crisp
     if (v.level[i] < 0) v.level[i] = 0;
     int h = (int)(v.level[i] + 0.5f);
     if (h < 2) h = 2;                                               // a thin resting line

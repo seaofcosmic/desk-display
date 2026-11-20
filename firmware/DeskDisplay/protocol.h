@@ -22,6 +22,7 @@
 // Display -> computer (text lines):
 //   DT:READY:1   DT:CMD:PLAY   DT:CMD:NEXT   DT:CMD:PREV   DT:CMD:SEEK:<ms>   DT:NAK:A
 //   DT:CMD:REM:<n>   (reminder n was tapped)
+//   DT:CMD:OPENAPP   (open Apple Music on the computer)
 //   DT:SET:H24=0,WC=0,RA=1,CA=1   (the display's settings that the computer needs to follow)
 #pragma once
 #include <stdint.h>

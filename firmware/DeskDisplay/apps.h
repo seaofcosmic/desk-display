@@ -60,18 +60,21 @@ struct Stats {
 
 // Everything the Settings app can change. Saved on the board.
 struct Settings {
-  uint8_t version     = 3;
+  uint8_t version     = 4;
   bool fullColor      = true;    // DISPLAY: the look. false = Minimal (amber), true = Full color
   bool albumColors    = true;    // MUSIC: in Full color, take the music screen's colors from the cover
   bool h24            = false;   // CLOCK: 24-hour time (also used for times in other apps)
-  bool weatherC       = false;   // WEATHER: Celsius instead of Fahrenheit
+  bool weatherC       = true;    // WEATHER: Celsius (false = Fahrenheit)
   bool reminderAlerts = true;    // REMINDERS: full-screen alert for timed reminders
   bool eventAlerts    = true;    // CALENDAR: alert 10 minutes before an event
   bool statsF         = false;   // SYSTEM: Fahrenheit instead of Celsius
   uint8_t brightness  = 3;       // DISPLAY: 0..3 = 25, 50, 75, 100 %
   bool alertLight     = true;    // DISPLAY: blink the light on the back during an alert
-  bool fullArt        = true;    // MUSIC: switch to the full-screen cover after a few seconds
+  uint8_t cover       = 2;       // MUSIC: full-screen cover 0 = off, 1 = only when the cover is tapped, 2 = also by itself
   uint8_t saver       = 2;       // DISPLAY: screensaver after 0 = never, 1 = 1, 2 = 5, 3 = 15 minutes
+  bool visualizer     = true;    // MUSIC: bars along the bottom of the full-screen cover
+  bool clockSky       = true;    // CLOCK: in Full color, the time sits on the moving sky
+  bool sunGlow        = true;    // SKIES: in Full color, orange and pink skies around sunrise and sunset
 };
 
 // ---------------------------------------------------------------- reading the text messages
@@ -187,6 +190,8 @@ static void parseAlert(const char* p, Alert& a) {
 // Minimal: every screen uses the amber THEME. Full color: each app has its own color, the
 // Weather app gets an animated sky, the Clock follows the time of day, and Music follows the cover.
 static bool fullColorMode = false;
+static bool sunGlowOn     = true;     // copies of settings.sunGlow and settings.clockSky, for the drawing code
+static bool clockSkyOn    = true;
 
 static const float APP_HUE[APP_COUNT] = { 38, 265, 208, 140, 5, 178, 215 };
 static const float APP_SAT[APP_COUNT] = { 0.85f, 0.60f, 0.75f, 0.55f, 0.70f, 0.60f, 0.15f };
@@ -216,8 +221,8 @@ static int skyPhase(const Weather& w, const ClockState& c) {
   if (!c.known || (w.valid && !haveSun)) return (w.valid && w.night) ? PHASE_NIGHT : PHASE_DAY;
   int rise, set; sunTimes(w, rise, set);
   int m = (int)((c.epoch / 60) % 1440);
-  if (abs(m - rise) <= GLOW_MINUTES) return PHASE_DAWN;
-  if (abs(m - set) <= GLOW_MINUTES)  return PHASE_DUSK;
+  if (sunGlowOn && abs(m - rise) <= GLOW_MINUTES) return PHASE_DAWN;
+  if (sunGlowOn && abs(m - set) <= GLOW_MINUTES)  return PHASE_DUSK;
   return (m > rise && m < set) ? PHASE_DAY : PHASE_NIGHT;
 }
 
@@ -493,7 +498,7 @@ static void drawClockDate(const ClockState& c) {
 }
 
 // ---- Full color look: the time sits on the animated sky, with the sun or moon crossing it.
-static bool clockImmersive(const ClockState& c) { return fullColorMode && sceneReady && c.known; }
+static bool clockImmersive(const ClockState& c) { return fullColorMode && clockSkyOn && sceneReady && c.known; }
 
 static void clockTimeText(const ClockState& c, char* time, size_t n, const char*& ampm) {
   struct tm tmv; clockParts(c.epoch, tmv);
@@ -899,16 +904,18 @@ static void drawSystemScreen(const Stats& st, const Settings& set) {
 }
 
 // ---------------------------------------------------------------- SETTINGS
-static const int SETTING_COUNT = 11;
-enum SettingRow { SET_LOOK, SET_ALBUM_COLORS, SET_FULL_ART, SET_TIME, SET_WEATHER_UNIT, SET_REMINDER_ALERTS,
-                  SET_EVENT_ALERTS, SET_STATS_UNIT, SET_BRIGHTNESS, SET_SAVER, SET_LIGHT };
+static const int SETTING_COUNT = 14;
+enum SettingRow { SET_LOOK, SET_ALBUM_COLORS, SET_FULL_ART, SET_VISUALIZER, SET_TIME, SET_CLOCK_SKY, SET_WEATHER_UNIT,
+                  SET_SUN_GLOW, SET_REMINDER_ALERTS, SET_EVENT_ALERTS, SET_STATS_UNIT, SET_BRIGHTNESS, SET_SAVER, SET_LIGHT };
 static const char* const SETTING_APP[SETTING_COUNT]  = {
-  "DISPLAY", "MUSIC, IN THE FULL COLOR LOOK", "MUSIC", "CLOCK", "WEATHER", "REMINDERS", "CALENDAR", "SYSTEM",
+  "DISPLAY", "MUSIC, IN THE FULL COLOR LOOK", "MUSIC", "MUSIC, ON THE FULL-SCREEN COVER", "CLOCK",
+  "CLOCK, IN THE FULL COLOR LOOK", "WEATHER", "WEATHER, CLOCK, SCREENSAVER", "REMINDERS", "CALENDAR", "SYSTEM",
   "DISPLAY", "DISPLAY", "DISPLAY",
 };
 static const char* const SETTING_NAME[SETTING_COUNT] = {
-  "Look", "Album colors", "Full-screen cover", "Time format", "Temperature", "Timed alerts", "Alert before events",
-  "Temperature", "Brightness", "Screensaver", "Alert light on the back",
+  "Look", "Album colors", "Full-screen cover", "Visualizer bars", "Time format", "Moving sky", "Temperature",
+  "Sunrise and sunset colors", "Timed alerts", "Alert before events", "Temperature", "Brightness", "Screensaver",
+  "Alert light on the back",
 };
 static const uint8_t SAVER_MINUTES[4] = { 0, 1, 5, 15 };
 
@@ -920,7 +927,12 @@ static void settingValue(const Settings& s, int i, char* out, size_t n, bool& is
   switch (i) {
     case SET_LOOK:            isSwitch = false; snprintf(out, n, s.fullColor ? "FULL COLOR" : "MINIMAL"); return;
     case SET_ALBUM_COLORS:    on = s.albumColors; break;
-    case SET_FULL_ART:        on = s.fullArt; break;
+    case SET_FULL_ART:
+      if (s.cover) { isSwitch = false; snprintf(out, n, s.cover == 2 ? "AUTO" : "ON TAP"); return; }
+      break;                                                    // off: drawn as a switch that is off
+    case SET_VISUALIZER:      on = s.visualizer; break;
+    case SET_CLOCK_SKY:       on = s.clockSky; break;
+    case SET_SUN_GLOW:        on = s.sunGlow; break;
     case SET_TIME:            isSwitch = false; snprintf(out, n, s.h24 ? "24 H" : "12 H"); return;
     case SET_WEATHER_UNIT:    isSwitch = false; snprintf(out, n, s.weatherC ? "C" : "F"); return;
     case SET_REMINDER_ALERTS: on = s.reminderAlerts; break;
@@ -940,7 +952,10 @@ static void settingAdvance(Settings& s, int i) {
   switch (i) {
     case SET_LOOK:            s.fullColor = !s.fullColor; break;
     case SET_ALBUM_COLORS:    s.albumColors = !s.albumColors; break;
-    case SET_FULL_ART:        s.fullArt = !s.fullArt; break;
+    case SET_FULL_ART:        s.cover = (s.cover + 2) % 3; break;      // AUTO -> ON TAP -> OFF -> AUTO
+    case SET_VISUALIZER:      s.visualizer = !s.visualizer; break;
+    case SET_CLOCK_SKY:       s.clockSky = !s.clockSky; break;
+    case SET_SUN_GLOW:        s.sunGlow = !s.sunGlow; break;
     case SET_TIME:            s.h24 = !s.h24; break;
     case SET_WEATHER_UNIT:    s.weatherC = !s.weatherC; break;
     case SET_REMINDER_ALERTS: s.reminderAlerts = !s.reminderAlerts; break;

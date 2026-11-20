@@ -1,0 +1,6 @@
+# Desk Display reminders. One per line. Save the file and the display updates.
+# Start a line with a time (3:30pm or 15:30) to get a full-screen alert at that time today.
+# Tapping a reminder on the display marks it done by putting [x] in front of it here.
+# Lines starting with # are ignored.
+
+Tap me on the display to check me off
