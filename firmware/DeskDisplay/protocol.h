@@ -17,6 +17,8 @@
 //   type 'N'  alert            "time\ntext"   (a timed reminder or an upcoming calendar event)
 //   type 'E'  calendar         text lines, see parseEvents() in apps.h
 //   type 'Y'  computer stats   text lines, see parseStats() in apps.h
+//   type 'L'  lyrics           first line S (timed) P (untimed) N (none) W (looking) E (couldn't look),
+//                              then one "milliseconds|words" line per lyric line
 //   type 'V'  sound levels     16 bytes, one per visualizer bar, 0 (silent) to 255, lowest notes first
 //
 // Display -> computer (text lines):
@@ -30,7 +32,7 @@
 
 static const int      ART_SIZE       = 140;
 static const uint32_t ART_BYTES      = (uint32_t)ART_SIZE * ART_SIZE * 2;
-static const uint32_t SMALL_MAX      = 1024;
+static const uint32_t SMALL_MAX      = 6144;    // the largest text message (lyrics for one song)
 
 static const uint8_t  STATE_PLAYING  = 0x01;
 static const uint8_t  STATE_HAS_POS  = 0x02;

@@ -405,6 +405,27 @@ static void drawStatusLabel(const UiState& s) {
   gfx->endWrite();
 }
 
+// ---- the LYRICS button, under the song info
+static const int LYR_BTN_X = TEXT_X, LYR_BTN_Y = 119, LYR_BTN_W = 92, LYR_BTN_H = 24;
+
+static bool lyricsButtonAt(int x, int y) {
+  return x >= LYR_BTN_X - 6 && x < LYR_BTN_X + LYR_BTN_W + 10 && y >= LYR_BTN_Y - 8 && y < LYR_BTN_Y + LYR_BTN_H + 4;
+}
+
+static void drawLyricsButton() {
+  gfx->startWrite();
+  gfx->fillRect(LYR_BTN_X, LYR_BTN_Y, LYR_BTN_W, LYR_BTN_H, musicPal.bg);
+  gfx->drawRect(LYR_BTN_X, LYR_BTN_Y, LYR_BTN_W, LYR_BTN_H, musicPal.accent);
+  for (int i = 0; i < 3; ++i)                                     // a small "lines of text" mark
+    gfx->fillRect(LYR_BTN_X + 9, LYR_BTN_Y + 7 + i * 4, i == 2 ? 7 : 11, 2, musicPal.accent);
+  gfx->setTextDatum(lgfx::textdatum_t::middle_left);
+  gfx->setFont(FONT_BODY);
+  gfx->setTextColor(musicPal.accent, musicPal.bg);
+  gfx->drawString("LYRICS", LYR_BTN_X + 28, LYR_BTN_Y + LYR_BTN_H / 2 + 1);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->endWrite();
+}
+
 static void drawTrackText(const UiState& s) {
   gfx->startWrite();
   gfx->fillRect(TEXT_X, TITLE_Y - 2, SCREEN_W - TEXT_X, BAR_AREA_Y - (TITLE_Y - 2), musicPal.bg);
@@ -412,18 +433,19 @@ static void drawTrackText(const UiState& s) {
 
   gfx->setFont(FONT_TITLE);
   gfx->setTextColor(musicPal.cream, musicPal.bg);
-  int y = drawWrapped(s.title[0] ? s.title : "Unknown track", TEXT_X, TITLE_Y, TEXT_W, 3, TITLE_LINE_H);
+  int y = drawWrapped(s.title[0] ? s.title : "Unknown track", TEXT_X, TITLE_Y, TEXT_W, 2, TITLE_LINE_H);
 
   y += 5;
   gfx->setFont(FONT_BODY);
   gfx->setTextColor(musicPal.accent, musicPal.bg);
-  if (s.artist[0]) y = drawWrapped(s.artist, TEXT_X, y, TEXT_W, 2, BODY_LINE_H);
+  if (s.artist[0]) y = drawWrapped(s.artist, TEXT_X, y, TEXT_W, 1, BODY_LINE_H);
 
   y += 4;
   gfx->setFont(FONT_SMALL);
   gfx->setTextColor(musicPal.dim, musicPal.bg);
-  if (s.album[0] && y + 8 <= BAR_AREA_Y - 2) drawWrapped(s.album, TEXT_X, y, TEXT_W, 1, 10);
+  if (s.album[0] && y + 8 <= LYR_BTN_Y - 4) drawWrapped(s.album, TEXT_X, y, TEXT_W, 1, 10);
   gfx->endWrite();
+  drawLyricsButton();
 }
 
 // Gauge + elapsed / total time. Drawn into an off-screen strip first so it never flickers.
@@ -626,4 +648,127 @@ static void drawFloatStep(const UiState& s, FloatState& f) {
   if (ny > f.y) artBackdrop(f.x, f.y, ART_SIZE, ny - f.y); else if (ny < f.y) artBackdrop(f.x, ny + ART_SIZE, ART_SIZE, f.y - ny);
   f.x = nx; f.y = ny;
   drawArtViewCover(s, f.x, f.y);
+}
+
+// ---------------------------------------------------------------- lyric mode
+// The words of the song, a few lines at a time, with the line being sung right now in the middle.
+// Timed lyrics follow the song exactly; untimed ones move through evenly over its length.
+enum LyricsState : uint8_t { LYR_WAITING, LYR_TIMED, LYR_UNTIMED, LYR_NONE, LYR_ERROR };
+static const int LYR_MAX_LINES = 160;
+struct Lyrics {
+  uint8_t  state = LYR_WAITING;
+  uint16_t count = 0;
+  uint32_t at[LYR_MAX_LINES];              // when each line starts, in milliseconds
+  uint16_t off[LYR_MAX_LINES];             // where each line's words start in text
+  char     text[6200];
+};
+
+static void parseLyrics(const char* p, uint32_t len, Lyrics& L) {
+  L.count = 0;
+  char k = len ? p[0] : 'N';
+  L.state = k == 'S' ? LYR_TIMED : k == 'P' ? LYR_UNTIMED : k == 'W' ? LYR_WAITING : k == 'E' ? LYR_ERROR : LYR_NONE;
+  uint32_t n = len < sizeof(L.text) - 1 ? len : sizeof(L.text) - 1;
+  memcpy(L.text, p, n);
+  L.text[n] = 0;
+  char* s = strchr(L.text, '\n');
+  while (s && L.count < LYR_MAX_LINES) {
+    *s++ = 0;                                    // end the previous line
+    char* bar = strchr(s, '|');
+    char* nl = strchr(s, '\n');
+    if (!bar || (nl && bar > nl)) { s = nl; continue; }
+    *bar = 0;
+    L.at[L.count] = (uint32_t)strtoul(s, nullptr, 10);
+    L.off[L.count] = (uint16_t)(bar + 1 - L.text);
+    ++L.count;
+    s = nl;
+  }
+  if ((L.state == LYR_TIMED || L.state == LYR_UNTIMED) && L.count == 0) L.state = LYR_NONE;
+}
+
+// The line being sung at this moment (-1 = before the first line).
+static int lyricsLineAt(const Lyrics& L, uint32_t posMs, uint32_t durMs) {
+  if (L.count == 0) return -1;
+  if (L.state == LYR_UNTIMED) {
+    if (!durMs) return 0;
+    int i = (int)((uint64_t)posMs * L.count / durMs);
+    return i >= L.count ? L.count - 1 : i;
+  }
+  int i = -1;
+  for (int k = 0; k < L.count && L.at[k] <= posMs + 200; ++k) i = k;   // a hair early, like karaoke
+  return i;
+}
+
+static const char* lyricsWords(const Lyrics& L, int i) {
+  if (i < 0 || i >= L.count) return "";
+  const char* w = L.text + L.off[i];
+  return w[0] ? w : "~ ~ ~";                     // an empty line is a break in the singing
+}
+
+static const int LYRV_TOP = 22;                  // the lyrics area, under the song name
+
+// The song name strip along the top.
+static void drawLyricsHeader(const UiState& s) {
+  artBackdrop(0, 0, SCREEN_W, LYRV_TOP);
+  gfx->fillRect(SCREEN_W / 2 - 22, 1, 44, 3, artBackdropBlurred ? 0xD6DEE8u : musicPal.dim);
+  char head[120];
+  const char* title = s.title[0] ? s.title : "Unknown track";
+  gfx->setFont(FONT_SMALL);
+  snprintf(head, sizeof head, "%s  -  %s", title, s.artist);
+  if (!s.artist[0] || gfx->textWidth(head) > SCREEN_W - 20) snprintf(head, sizeof head, "%s", title);   // too long: just the song
+  gfx->setTextDatum(lgfx::textdatum_t::top_center);
+  gfx->setTextColor(artBackdropBlurred ? 0xD6DEE8u : musicPal.dim);
+  drawWrapped(head, SCREEN_W / 2, 9, SCREEN_W - 20, 1, 10);
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+}
+
+// The lines: the one being sung large in the middle, its neighbors smaller and fainter.
+static void drawLyricsLines(const Lyrics& L, int cur) {
+  artBackdrop(0, LYRV_TOP, SCREEN_W, SCREEN_H - LYRV_TOP);
+  bool color = artBackdropBlurred;
+  uint32_t bright = color ? 0xFFFFFFu : musicPal.cream;
+  uint32_t near   = color ? 0xC8D0DAu : musicPal.accent;
+  uint32_t far    = color ? 0x8A929Cu : musicPal.dim;
+  gfx->startWrite();
+  gfx->setTextDatum(lgfx::textdatum_t::top_center);
+  const int cx = SCREEN_W / 2, w = SCREEN_W - 24;
+
+  const char* msg = nullptr;
+  if (L.state == LYR_WAITING) msg = "Looking up the lyrics...";
+  else if (L.state == LYR_NONE) msg = "No lyrics found for this song.";
+  else if (L.state == LYR_ERROR) msg = "Couldn't reach the lyrics service.";
+  if (msg) {
+    gfx->setFont(FONT_TITLE);
+    gfx->setTextColor(near);
+    drawWrapped(msg, cx, 110, w, 2, TITLE_LINE_H);
+    gfx->setFont(FONT_SMALL);
+    gfx->setTextColor(far);
+    gfx->drawString("TAP FOR THE CONTROLS", cx, SCREEN_H - 14);
+    gfx->setTextDatum(lgfx::textdatum_t::top_left);
+    gfx->endWrite();
+    return;
+  }
+
+  // two lines before
+  gfx->setFont(FONT_BODY);
+  if (cur - 2 >= 0) { gfx->setTextColor(far);  drawWrapped(lyricsWords(L, cur - 2), cx, 40, w, 1, BODY_LINE_H); }
+  if (cur - 1 >= 0) { gfx->setTextColor(near); drawWrapped(lyricsWords(L, cur - 1), cx, 64, w, 1, BODY_LINE_H); }
+  // the line being sung (or the first line, dimmed, before the singing starts)
+  gfx->setFont(FONT_TITLE);
+  gfx->setTextColor(cur >= 0 ? bright : near);
+  int y = drawWrapped(lyricsWords(L, cur >= 0 ? cur : 0), cx, 96, w, 2, TITLE_LINE_H + 2);
+  // what comes next
+  gfx->setFont(FONT_BODY);
+  int next = cur >= 0 ? cur + 1 : 1;
+  y = y < 140 ? 148 : y + 10;
+  for (int k = 0; k < 3 && next + k < L.count && y < SCREEN_H - 14; ++k) {
+    gfx->setTextColor(k == 0 ? near : far);
+    y = drawWrapped(lyricsWords(L, next + k), cx, y, w, 1, BODY_LINE_H) + 8;
+  }
+  if (L.state == LYR_UNTIMED) {
+    gfx->setFont(FONT_SMALL);
+    gfx->setTextColor(far);
+    gfx->drawString("UNTIMED LYRICS", cx, SCREEN_H - 12);
+  }
+  gfx->setTextDatum(lgfx::textdatum_t::top_left);
+  gfx->endWrite();
 }

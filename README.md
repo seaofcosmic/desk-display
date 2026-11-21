@@ -101,6 +101,8 @@ Settings live on the display and are saved on the board. Tap a row to change it.
 
 Alerts and the startup screens stay amber in both looks.
 
+**Lyric mode:** tap **LYRICS** under the song name to see the words. The line being sung is large in the middle, with the lines before and after it smaller, and it follows the song as it plays. Tap anywhere to get the controls back. The lyrics come from [LRCLIB](https://lrclib.net), a free lyrics service; most songs there are timed line by line. If a song only has untimed lyrics, the screen moves through them evenly over the length of the song and says "UNTIMED LYRICS". If LRCLIB doesn't have the song, the screen says so.
+
 **Nothing playing?** The Music screen shows an **OPEN APPLE MUSIC** button. Tap it and the computer opens Apple Music (or brings it to the front), so you can start something from there.
 
 ## Music: full-screen cover and visualizer

@@ -37,6 +37,7 @@ import urllib.request
 from typing import Optional
 
 import audio_levels
+import lyrics
 import extras
 import notion_calendar
 import pc_stats
@@ -267,6 +268,7 @@ class Companion:
         self.media = media
         self.args = args
         self.online_results: "queue.Queue" = queue.Queue()
+        self.lyrics = lyrics.LyricsFetcher(self.log, args.verbose)      # for the display's lyric mode
 
         self.settings = extras.load_settings(args.data_dir, self.log)
         # What the display's Settings app is set to. The display reports these when it connects.
@@ -614,10 +616,19 @@ class Companion:
                         last_album = current.album
                         track_started = now
                         art_hash, art_frame, online_started = None, None, False
+                        # lyrics: tell the display we're looking, then look in the background
+                        link.send(frame(b"L", b"W"))
+                        self.lyrics.request(current.key(), current.title, current.artist, current.album,
+                                            (current.duration_ms or 0) / 1000.0 or None)
                     state = (current.playing, current.can_seek, current.duration_ms, current.position_ms is None)
                     if state != last_state or now - last_state_at >= 1.0:
                         link.send(encode_state(current))
                         last_state, last_state_at = state, now
+
+            # ---- lyrics that have come back for the song that's playing
+            for key, kind, lines in self.lyrics.take():
+                if current is not None and key == current.key():
+                    link.send(frame(b"L", lyrics.payload(kind, lines, to_ascii)))
 
             # ---- sound levels for the visualizer, about 14 times a second while music plays
             if now - last_levels_at >= 0.04:              # 25 times a second

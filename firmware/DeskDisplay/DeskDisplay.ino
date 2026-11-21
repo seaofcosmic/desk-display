@@ -163,6 +163,9 @@ static Settings     settings;
 static int          setPage = 0;
 
 static bool         artView = false;          // music: the full-screen cover is showing instead of the controls
+static bool         lyricsView = false;       // music: the lyrics are showing instead of the controls
+static Lyrics       lyrics;                   // the current song's lyrics
+static int          lyricsShown = -9;         // the line on screen (-9 = needs a full redraw)
 static VizState     viz;                      // music: the visualizer bars
 static uint32_t     lastMetaMs = 0;           // when the current track was announced
 static uint32_t     lastTouchMs = 0;          // when the screen was last touched
@@ -188,8 +191,9 @@ static bool before(uint32_t now, uint32_t deadline) { return (int32_t)(now - dea
 static View musicView()           { return !linkUp ? VIEW_NOLINK : (hasTrack ? VIEW_PLAYING : VIEW_STANDBY); }
 static bool appVisible(App a)     { return !menuOpen && !alertOpen && !saverOn && app == a; }
 static bool playingVisible()      { return appVisible(APP_MUSIC) && musicView() == VIEW_PLAYING; }
-static bool controlsVisible()     { return playingVisible() && !artView; }   // the cover, text, gauge and buttons
-static bool artViewVisible()      { return playingVisible() && artView; }
+static bool controlsVisible()     { return playingVisible() && !artView && !lyricsView; }   // the cover, text, gauge and buttons
+static bool artViewVisible()      { return playingVisible() && artView && !lyricsView; }
+static bool lyricsVisible()       { return playingVisible() && lyricsView; }
 static uint32_t clockNow(uint32_t now) { return clockSyncEpoch + (now - clockSyncAtMs) / 1000; }
 
 // The clock, set to this moment.
@@ -320,7 +324,11 @@ static void showCurrent() {
     default:
       if (musicView() == VIEW_NOLINK)       drawNoLink();
       else if (musicView() == VIEW_STANDBY) drawStandby();
-      else if (artView) {
+      else if (lyricsView) {
+        artBackdrop(0, 0, SCREEN_W, SCREEN_H);
+        drawLyricsHeader(ui);
+        lyricsShown = -9;                         // the lines are drawn by loop()
+      } else if (artView) {
         drawArtView(ui);
         vizReset(viz);
       } else {
@@ -378,6 +386,8 @@ static void handleFrame() {
       if (partial) { drawArt(ui); drawTrackText(ui); barDirty = true; }
       if (coverUp) showCurrent();
       if (saverOn && saverFloat) saverRedraw = true;
+      lyrics.state = LYR_WAITING; lyrics.count = 0;
+      if (lyricsVisible()) showCurrent();
       break;
 
     case 'S': {
@@ -424,8 +434,14 @@ static void handleFrame() {
       }
       break;
 
+    case 'L':                                  // lyrics for the current song
+      parseLyrics((const char*)parser->payload(), parser->length(), lyrics);
+      lyricsShown = -9;
+      break;
+
     case 'X':
       artView = false;
+      lyricsView = false;
       hasTrack = false;
       ui.artValid = false;
       ui.title[0] = ui.artist[0] = ui.album[0] = 0;
@@ -537,7 +553,9 @@ static void onTap(int x, int y) {
   }
   if (app == APP_MUSIC && musicView() == VIEW_PLAYING) {
     // Tapping the cover makes it fill the screen; tapping the full-screen cover brings the controls back.
-    if (artView) { artView = false; showCurrent(); }
+    if (lyricsView) { lyricsView = false; showCurrent(); }                         // any tap: back to the controls
+    else if (artView) { artView = false; showCurrent(); }
+    else if (lyricsButtonAt(x, y)) { lyricsView = true; showCurrent(); }
     else if (settings.cover && x < ART_X + ART_SIZE + 4 && y < BAR_AREA_Y - 6) { artView = true; showCurrent(); }
   } else if (app == APP_MUSIC && musicView() == VIEW_STANDBY && openButtonAt(x, y)) {
     Serial.print("DT:CMD:OPENAPP\n");          // the computer opens Apple Music
@@ -810,7 +828,7 @@ void loop() {
   if (!saverOn && !alertOpen && linkUp && (settings.saver & 3) &&
       now - lastTouchMs >= (uint32_t)SAVER_MINUTES[settings.saver & 3] * SAVER_MINUTE_MS) {
     if (hasTrack && ui.playing) {
-      if (!playingVisible() || (!artView && settings.cover)) {
+      if (!playingVisible() || (!artView && !lyricsView && settings.cover)) {
         app = APP_MUSIC;
         menuOpen = false;
         weatherDetails = false;
@@ -848,6 +866,15 @@ void loop() {
       ui.pressed == ZONE_NONE && now - lastTouchMs >= ART_IDLE_MS && now - lastMetaMs >= 1500) {
     artView = true;
     showCurrent();
+  }
+
+  if (lyricsVisible()) {                        // move to the line being sung
+    static uint32_t lastLyrMs = 0;
+    if (now - lastLyrMs >= 100) {
+      lastLyrMs = now;
+      int cur = lyricsLineAt(lyrics, currentPosMs(now), ui.durMs);
+      if (cur != lyricsShown) { lyricsShown = cur; drawLyricsLines(lyrics, cur); }
+    }
   }
 
   if (artViewVisible() && settings.visualizer) {   // the visualizer bars
