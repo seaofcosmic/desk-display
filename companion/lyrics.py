@@ -92,7 +92,7 @@ def find(title: str, artist: str, album: str = "", duration_s: Optional[float] =
 
 
 BREAK = "..."              # shown during the intro, before the singing starts
-EARLY_MS = 500             # lines appear this much early, to make up for the delay in getting the song's position
+EARLY_MS = 600             # lines appear this much early, to make up for the delay in getting the song's position
 
 
 def shape(lines: Lines, early_ms: int = EARLY_MS) -> Lines:
