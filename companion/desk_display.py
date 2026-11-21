@@ -628,7 +628,11 @@ class Companion:
             # ---- lyrics that have come back for the song that's playing
             for key, kind, lines in self.lyrics.take():
                 if current is not None and key == current.key():
-                    link.send(frame(b"L", lyrics.payload(kind, lines, to_ascii)))
+                    try:   # settings.json "lyrics_early_ms": how early lines appear (default 500)
+                        early = int(self.settings.get("lyrics_early_ms", lyrics.EARLY_MS))
+                    except (TypeError, ValueError):
+                        early = lyrics.EARLY_MS
+                    link.send(frame(b"L", lyrics.payload(kind, lines, to_ascii, early)))
 
             # ---- sound levels for the visualizer, about 14 times a second while music plays
             if now - last_levels_at >= 0.04:              # 25 times a second

@@ -91,9 +91,43 @@ def find(title: str, artist: str, album: str = "", duration_s: Optional[float] =
     return "N", []
 
 
-def payload(kind: str, lines: Lines, to_ascii) -> bytes:
+BREAK = "..."              # shown while nothing is being sung
+EARLY_MS = 500             # lines appear this much early, to make up for the delay in getting the song's position
+
+
+def _line_length_ms(words: str) -> int:
+    """About how long a line takes to sing, from how many words it has."""
+    return max(2500, min(7000, 1500 + 300 * len(words.split())))
+
+
+def shape(lines: Lines, early_ms: int = EARLY_MS) -> Lines:
+    """Timed lyrics, ready to show: moved a little earlier, and with a "..." wherever nothing is sung:
+    before the first line, at blank lines, and in long instrumental gaps."""
+    out: Lines = []
+    for i, (ms, words) in enumerate(lines):
+        ms = max(0, ms - early_ms)
+        words = words.strip() or BREAK
+        out.append((ms, words))
+        if words != BREAK and i + 1 < len(lines):
+            nxt = max(0, lines[i + 1][0] - early_ms)
+            end = ms + _line_length_ms(words)
+            if nxt - end > 2500:                          # a long gap after this line
+                out.append((end, BREAK))
+    if out and out[0][0] > 1500:                          # an intro before the singing starts
+        out.insert(0, (0, BREAK))
+    tidy: Lines = []
+    for ms, words in out:                                 # no two "..." in a row
+        if tidy and words == BREAK and tidy[-1][1] == BREAK:
+            continue
+        tidy.append((ms, words))
+    return tidy
+
+
+def payload(kind: str, lines: Lines, to_ascii, early_ms: int = EARLY_MS) -> bytes:
     """What the display gets: a first line S (timed), P (untimed), N (none), W (looking) or E (couldn't
     look), then one "milliseconds|words" line per lyric line."""
+    if kind == "S":
+        lines = shape(lines, early_ms)
     out = bytearray(kind.encode())
     for ms, words in lines:
         row = b"\n" + str(int(ms)).encode() + b"|" + to_ascii(words, MAX_LINE).replace(b"\n", b" ")
