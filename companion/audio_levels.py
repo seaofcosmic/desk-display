@@ -22,7 +22,7 @@ LOW_HZ, HIGH_HZ = 50.0, 10000.0
 FFT_SIZE = 4096                 # long window: used only for the bass bars, so they get real detail
 FFT_FAST = 1024                 # short window (about 20 ms) for everything above the bass, so the bars keep time
 BASS_SPLIT_HZ = 300.0           # bars below this use the long window, the rest the short one
-RANGE_DB = 45.0                 # loudness range from an empty bar to a full one
+RANGE_DB = 34.0                 # loudness range from an empty bar to a full one (smaller = more sensitive)
 TILT_DB_PER_OCTAVE = 1.0        # a slight lift for the treble, which is usually quieter than the rest of a song
 SPREAD = 1.8                    # "Monstercat" smoothing: each bar lifts its neighbors a little (1 = none)
 
@@ -76,10 +76,10 @@ class Spectrum:
         level = (db - (self.ref_db - RANGE_DB)) / RANGE_DB    # 0 = empty, 1 = full
         # automatic sensitivity: back off quickly when bars hit the top, recover slowly
         top = level.max()
-        if top > 1.05:
-            self.ref_db += min(1.0, (top - 1.0) * RANGE_DB * 0.25)   # back off gently: one loud hit can't empty the bars
-        elif top < 0.85:
-            self.ref_db -= 0.5                                        # and come back about 7 dB a second
+        if top > 1.2:
+            self.ref_db += min(0.8, (top - 1.2) * RANGE_DB * 0.25)   # back off gently: one loud hit can't empty the bars
+        elif top < 0.95:
+            self.ref_db -= 0.8                                        # and climb back quickly when it's quiet
         self.ref_db = max(-90.0, min(20.0, self.ref_db))
         level = np.clip(level, 0.0, 1.0)
         if SPREAD > 1.0:                                       # neighbors lift each other a little
@@ -184,6 +184,11 @@ class AppListener:
         import psutil
         self.np, self.proctap, self.psutil = np, proctap, psutil
         self.app = app.lower().replace(" ", "")
+        # Processes that may play Apple Music's sound, best guess first. A process that stays silent
+        # while a song plays is skipped for the next one.
+        self.names = [self.app] + [n for n in ("applemusic", "amplibraryagent", "itunes") if n != self.app]
+        self.tried = set()
+        self.log = print
         self.lock = threading.Lock()
         self.samples = np.zeros(FFT_SIZE)
         self.last_data = 0.0
@@ -192,20 +197,43 @@ class AppListener:
         self.next_look = 0.0
         self.spectrum = Spectrum(48000)       # proc-tap always delivers 48 kHz stereo
 
-    def _find_pid(self):
-        first = None
+    def _candidates(self):
+        """(pid, name) of every process that might be playing Apple Music, best guess first."""
+        found = []
         for p in self.psutil.process_iter(["pid", "name", "ppid"]):
             name = (p.info.get("name") or "").lower().replace(" ", "")
-            if self.app not in name:
-                continue
-            try:
-                parent = (self.psutil.Process(p.info["ppid"]).name() or "").lower().replace(" ", "")
-            except Exception:
-                parent = ""
-            if self.app not in parent:      # the app's main process (its children are included)
-                return p.info["pid"]
-            first = first or p.info["pid"]
-        return first
+            for rank, want in enumerate(self.names):
+                if want in name:
+                    try:
+                        parent = (self.psutil.Process(p.info["ppid"]).name() or "").lower().replace(" ", "")
+                    except Exception:
+                        parent = ""
+                    top = 0 if want not in parent else 1        # the app's main process before its helpers
+                    found.append((rank, top, p.info["pid"], p.info.get("name") or name))
+                    break
+        found.sort()
+        return [(pid, name) for _, _, pid, name in found]
+
+    def _find_pid(self):
+        for pid, name in self._candidates():
+            if pid not in self.tried:
+                self.name = name
+                return pid
+        return None
+
+    def skip_current(self) -> bool:
+        """The process being listened to stayed silent during a song: move on to the next one.
+        Returns False when there's nothing left to try."""
+        if self.pid is not None:
+            self.tried.add(self.pid)
+        self.close()
+        self.next_look = 0.0
+        left = [pid for pid, _ in self._candidates() if pid not in self.tried]
+        if not left:
+            self.tried.clear()           # start over later (Apple Music may have restarted)
+            self.next_look = time.monotonic() + 30.0
+            return False
+        return True
 
     def _on_sound(self, data, frames):
         np = self.np
@@ -235,6 +263,7 @@ class AppListener:
                     cap = self.proctap.ProcessAudioCapture(pid, on_data=self._on_sound)
                     cap.start()
                     self.cap, self.pid = cap, pid
+                    self.log(f"Visualizer: listening to {self.name} (process {pid}).")
         with self.lock:
             samples, age = self.samples.copy(), now - self.last_data
         if self.cap is None or age > 0.5:
@@ -256,6 +285,7 @@ class Levels:
         self.app_only = False
         self.silent_since = None
         self.heard_app = False             # has the one-app capture ever heard anything?
+        self.still = False                 # Apple Music only, but it can't be heard: keep the bars still
         if pretend:
             log("Visualizer: demo mode, the bars follow a made-up pattern.")
             return
@@ -263,13 +293,18 @@ class Levels:
             if app:
                 try:
                     self.listener = AppListener(app)
+                    self.listener.log = log
                     self.real = self.app_only = True
                     log("Visualizer: following only the sound from Apple Music." if "applemusic" in app.lower()
                         else f"Visualizer: following only the sound from {app}.")
                     return
                 except Exception as e:
-                    if verbose:
-                        log("visualizer error (one app):", repr(e))
+                    # Never fall back to the whole computer's sound when only Apple Music was asked for.
+                    log("Visualizer: can't listen to Apple Music by itself on this computer, so the bars stay still.",
+                        f"({type(e).__name__}: {e})")
+                    log("  If this says proctap is missing: close this, run start_windows.bat once and wait for it to finish.")
+                    self.still = True
+                    return
             try:
                 self.listener = SpeakerListener()
                 self.real = True
@@ -283,7 +318,7 @@ class Levels:
         log("Visualizer: this computer's sound cannot be read here, so the bars follow a made-up pattern.")
 
     def read(self, playing: bool) -> bytes:
-        if not playing:
+        if not playing or self.still:
             self.silent_since = None
             return bytes(BARS)
         if self.listener:
@@ -294,23 +329,23 @@ class Levels:
                     self.log("visualizer error:", repr(e))
                 levels = bytes(BARS)
             if self.app_only:
-                # Playing, yet nothing heard from the app for a while: this computer can't hear one
-                # app on its own after all. Fall back to everything it plays rather than flat bars.
+                # Playing, yet nothing heard from this Apple process for a while: it isn't the one
+                # making the sound. Try the next one. Never fall back to the rest of the computer's sound.
                 now = time.monotonic()
                 if any(levels):
                     self.silent_since = None
-                    self.heard_app = True
-                elif self.heard_app:
-                    pass                        # it works; this is just a quiet moment in the song
+                    if not self.heard_app:
+                        self.heard_app = True
+                        self.log("Visualizer: hearing Apple Music.")
                 elif self.silent_since is None:
                     self.silent_since = now
-                elif now - self.silent_since > 12.0:
-                    try:
-                        self.listener.close()
-                        self.listener = SpeakerListener()
-                        self.log("Visualizer: could not hear Apple Music on its own, so it now follows all of this computer's sound.")
-                    except Exception:
-                        self.listener = None
-                    self.app_only = False
+                elif now - self.silent_since > 8.0:
+                    self.silent_since = None
+                    if self.heard_app:
+                        pass                    # it worked before: just a quiet part of the song
+                    elif not self.listener.skip_current():
+                        self.log("Visualizer: could not hear Apple Music by itself, so the bars stay still "
+                                 "(other apps' sound is never used). Run start_windows.bat --verbose and "
+                                 "send the Visualizer lines.")
             return levels
         return pattern(time.monotonic())
